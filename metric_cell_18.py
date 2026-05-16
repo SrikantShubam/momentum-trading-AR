@@ -1922,14 +1922,7 @@ def _eval_program_trial(program, context):
         lo = w * sz
         hi = (w + 1) * sz if w < WF_WINDOWS - 1 else n
         sc = c_core.iloc[lo:hi]
-        sv = v_core.iloc[lo:hi]
-        sx = x_core.iloc[lo:hi] if x_core is not None else None
-        st = t_core.iloc[lo:hi] if t_core is not None else None
-        sig_w, err_w = run_signal_code(code, sc, sv, vix_s=sx, tnx_s=st, timeout=EVAL_TIMEOUT_SEC)
-        if err_w:
-            continue
-        if flipped:
-            sig_w = -sig_w
+        sig_w = sig_core.iloc[lo:hi]
         mw = backtest(sig_w, sc)
         wf.append({"window": w, "sharpe": mw.get("sharpe", 0.0)})
     wf_median, wf_min = wf_summary(wf)
@@ -1942,16 +1935,9 @@ def _eval_program_trial(program, context):
         lo = w * val_sz
         hi = (w + 1) * val_sz if w < val_windows - 1 else n_val
         sc = c_val.iloc[lo:hi]
-        sv = v_val.iloc[lo:hi]
-        sx = x_val.iloc[lo:hi] if x_val is not None else None
-        st = t_val.iloc[lo:hi] if t_val is not None else None
         if len(sc) < 60:
             continue
-        sig_w, err_w = run_signal_code(code, sc, sv, vix_s=sx, tnx_s=st, timeout=EVAL_TIMEOUT_SEC)
-        if err_w:
-            continue
-        if flipped:
-            sig_w = -sig_w
+        sig_w = sig_val.iloc[lo:hi]
         mw = backtest(sig_w, sc)
         val_wf.append({"window": w, "sharpe": mw.get("sharpe", 0.0)})
     val_wf_median, val_wf_min = wf_summary(val_wf)

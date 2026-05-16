@@ -1013,6 +1013,11 @@ def evaluate_row_on_test(row):
         return panel_sig, panel_metrics, _oriented_metrics(panel_metrics, flipped=False)
 
     sig, m, oriented = _run_panel_eval(close_test, volume_test, vix_test, tnx_test, timeout=25)
+
+    def _slice_eval(panel_sig, panel_close, cost_bps=0.0):
+        sub_m = backtest(panel_sig, panel_close, cost_bps=cost_bps)
+        return sub_m, _oriented_metrics(sub_m, flipped=False)
+
     beta = oriented["beta"]
     consistency = oriented["consistency"]
     test_sharpe = oriented["sharpe"]
@@ -1027,13 +1032,7 @@ def evaluate_row_on_test(row):
         lo = w * sz
         hi = (w + 1) * sz if w < WF_WINDOWS - 1 else n
         try:
-            _, sub_m, sub_oriented = _run_panel_eval(
-                close_test.iloc[lo:hi],
-                volume_test.iloc[lo:hi],
-                vix_test.iloc[lo:hi] if vix_test is not None else None,
-                tnx_test.iloc[lo:hi] if tnx_test is not None else None,
-                timeout=20,
-            )
+            sub_m, sub_oriented = _slice_eval(sig.iloc[lo:hi], close_test.iloc[lo:hi])
         except Exception:
             continue
         wf.append({"window": w, "sharpe": sub_oriented.get("sharpe", sub_m.get("sharpe", 0.0))})
@@ -1091,12 +1090,9 @@ def evaluate_row_on_test(row):
     chronological_holdout = []
     for spec in _build_chronological_window_specs(close_test.index, CHRONOLOGICAL_HOLDOUT_SEGMENTS, min_points=60):
         try:
-            _, sub_m, sub_oriented = _run_panel_eval(
+            sub_m, sub_oriented = _slice_eval(
+                sig.iloc[spec["lo"]:spec["hi"]],
                 close_test.iloc[spec["lo"]:spec["hi"]],
-                volume_test.iloc[spec["lo"]:spec["hi"]],
-                vix_test.iloc[spec["lo"]:spec["hi"]] if vix_test is not None else None,
-                tnx_test.iloc[spec["lo"]:spec["hi"]] if tnx_test is not None else None,
-                timeout=20,
             )
         except Exception:
             continue
@@ -1117,12 +1113,9 @@ def evaluate_row_on_test(row):
     rolling_holdout = []
     for spec in _build_rolling_window_specs(close_test.index, ROLLING_HOLDOUT_SEGMENTS, min_points=ROLLING_HOLDOUT_MIN_POINTS):
         try:
-            _, sub_m, sub_oriented = _run_panel_eval(
+            sub_m, sub_oriented = _slice_eval(
+                sig.iloc[spec["lo"]:spec["hi"]],
                 close_test.iloc[spec["lo"]:spec["hi"]],
-                volume_test.iloc[spec["lo"]:spec["hi"]],
-                vix_test.iloc[spec["lo"]:spec["hi"]] if vix_test is not None else None,
-                tnx_test.iloc[spec["lo"]:spec["hi"]] if tnx_test is not None else None,
-                timeout=20,
             )
         except Exception:
             continue

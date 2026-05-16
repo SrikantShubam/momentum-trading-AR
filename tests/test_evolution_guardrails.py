@@ -297,6 +297,8 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertIn("for variant in EVOLVE_CHAMPION_VARIANTS:", metric_source)
         self.assertIn("- EVOLVE_VAL_WF_FLOOR_PENALTY * wf_floor_shortfall", metric_source)
         self.assertIn("val_wf_missing_penalty", metric_source)
+        self.assertIn("sig_w = sig_core.iloc[lo:hi]", metric_source)
+        self.assertIn("sig_w = sig_val.iloc[lo:hi]", metric_source)
 
     def test_heldout_export_preserves_program_evolution_code(self):
         heldout_source = HELDOUT_CELL.read_text()
@@ -304,6 +306,8 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertIn("def _oriented_signal_code(code_str, flipped=False):", heldout_source)
         self.assertIn('"code": _oriented_signal_code(raw_code, flipped)', heldout_source)
         self.assertIn('"code_is_oriented": True', heldout_source)
+        self.assertIn("def _slice_eval(panel_sig, panel_close, cost_bps=0.0):", heldout_source)
+        self.assertIn("sub_m, sub_oriented = _slice_eval(sig.iloc[lo:hi], close_test.iloc[lo:hi])", heldout_source)
 
     def test_notebook_heldout_cell_matches_safe_export_logic(self):
         nb = json.loads(NOTEBOOK.read_text())
@@ -316,6 +320,7 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertIn('fn_code = row.get("code") or deterministic_code(row)', heldout_source)
         self.assertIn("def _oriented_signal_code(code_str, flipped=False):", heldout_source)
         self.assertIn('"code": _oriented_signal_code(raw_code, flipped)', heldout_source)
+        self.assertIn("def _slice_eval(panel_sig, panel_close, cost_bps=0.0):", heldout_source)
         self.assertIn('evaluated = []', heldout_source)
         self.assertIn('held-out eval skipped', heldout_source)
         self.assertNotIn('return sorted([evaluate_row_on_test(r) for r in det_ranked]', heldout_source)
