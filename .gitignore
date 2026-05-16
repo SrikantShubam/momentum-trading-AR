@@ -1,0 +1,15 @@
+.env
+kaggle.json
+.kaggle*/
+.claude/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+results*.zip
+results*_latest/
+tmp_*/
+outputs/
+kaggle_run_v*/
+tmp_kaggle_output/
+tmp_nilay_output_check/
