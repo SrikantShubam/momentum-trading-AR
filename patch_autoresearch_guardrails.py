@@ -172,6 +172,7 @@ RUN_DETERMINISTIC_SEARCH = True
 RUN_LLM_STAGE            = False
 RUN_MOE_STAGE            = False
 RUN_BNB_MODEL_LOAD       = _env_truthy(os.getenv("AUTORESEARCH_ENABLE_BNB_LOAD"), default=False)
+RUN_LLM_SMOKE            = _env_truthy(os.getenv("AUTORESEARCH_RUN_LLM_SMOKE"), default=False)
 RUN_PARAM_SEARCH         = True
 RUN_HELDOUT_EVAL         = True
 RUN_REPORTS              = True
@@ -205,6 +206,7 @@ RUNTIME_STATE = {
     "actual_model_id": None,
     "llm_stage_enabled": bool(RUN_LLM_STAGE),
     "moe_stage_enabled": bool(RUN_MOE_STAGE),
+    "llm_smoke_enabled": bool(RUN_LLM_SMOKE),
     "llm_stage_loaded": False,
     "llm_stage_executed": False,
     "llm_calls": 0,
@@ -296,13 +298,14 @@ gc.collect()
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
-REQUESTED_LLM_MODEL = bool(RUN_LLM_STAGE or RUN_MOE_STAGE)
+REQUESTED_LLM_MODEL = bool(RUN_LLM_STAGE or RUN_MOE_STAGE or RUN_LLM_SMOKE)
 SHOULD_LOAD_LLM_MODEL = bool(REQUESTED_LLM_MODEL and RUN_BNB_MODEL_LOAD)
 tok = None
 model = None
 update_runtime_state(
     llm_stage_enabled=bool(RUN_LLM_STAGE),
     moe_stage_enabled=bool(RUN_MOE_STAGE),
+    llm_smoke_enabled=bool(RUN_LLM_SMOKE),
     bnb_model_load_enabled=bool(RUN_BNB_MODEL_LOAD),
     llm_stage_loaded=False,
     llm_stage_executed=False,
@@ -355,6 +358,7 @@ def refresh_llm_runtime_status():
         "fallback_model_id": CONFIGURED_FALLBACK_MODEL_ID,
         "llm_stage_enabled": bool(RUN_LLM_STAGE),
         "moe_stage_enabled": bool(RUN_MOE_STAGE),
+        "llm_smoke_enabled": bool(RUN_LLM_SMOKE),
         "should_load": bool(SHOULD_LOAD_LLM_MODEL),
         "loaded": bool(tok is not None and model is not None),
         "active_model_id": ACTIVE_MODEL_ID,
@@ -417,6 +421,16 @@ def ensure_model_loaded():
 
 if SHOULD_LOAD_LLM_MODEL:
     ensure_model_loaded()
+    if RUN_LLM_SMOKE:
+        try:
+            smoke_ids = tok("LLM smoke test", return_tensors="pt").input_ids.to(model.device)
+            with torch.no_grad():
+                _ = model.generate(smoke_ids, max_new_tokens=1, do_sample=False, pad_token_id=tok.pad_token_id)
+            update_runtime_state(llm_smoke_executed=True, llm_smoke_ok=True)
+            print("LLM smoke test: OK")
+        except Exception as e:
+            update_runtime_state(llm_smoke_executed=True, llm_smoke_ok=False, llm_smoke_error=f"{type(e).__name__}: {e}")
+            print(f"LLM smoke test failed: {type(e).__name__}: {e}")
 else:
     if REQUESTED_LLM_MODEL:
         update_runtime_state(llm_load_strategy="skipped_bnb_disabled", llm_stage_error="bnb_model_load_disabled")

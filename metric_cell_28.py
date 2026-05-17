@@ -294,6 +294,11 @@ partial_run_report = _safe_dict_from_global("PARTIAL_REPORT_FILE", "partial_run_
 evolution_health_lines = _evolution_health_lines(evolution_summary, partial_run_report)
 partial_run_report_line = _partial_report_line(partial_run_report)
 search_robustness_line = _robustness_summary(search_rows)
+evolution_policy = evolution_summary.get("policy", {}) if isinstance(evolution_summary.get("policy"), dict) else {}
+adaptive_diagnostic_run = bool(evolution_policy.get("adaptive_diagnostic_run"))
+latest_family_telemetry = {}
+if isinstance(evolution_summary.get("latest"), dict):
+    latest_family_telemetry = evolution_summary["latest"].get("family_telemetry", {}) or {}
 
 unique_param_sigs = len({r.get("signature") for r in param if r.get("signature")})
 param_unique_ratio = unique_param_sigs / max(len(param), 1)
@@ -323,7 +328,6 @@ economic_success = bool(
 
 adherence_score = 0
 adherence_notes = []
-evolution_policy = evolution_summary.get("policy", {}) if isinstance(evolution_summary.get("policy"), dict) else {}
 if evolution_summary and evolution_summary.get("generations_executed", 0) >= 20:
     adherence_score += 20
 else:
@@ -402,6 +406,7 @@ md_text = f"""# AutoResearch v2 - Momentum Alpha Discovery
 
 **Run:** {run_id} | profile={runtime_profile} | scope={artifact_scope}
 **Benchmark mode:** {benchmark_mode}
+**Adaptive diagnostic run:** {adaptive_diagnostic_run}
 **Configured model:** {configured_model_id}
 **Actual loaded model:** {actual_model_id}
 **LLM stage:** enabled={llm_enabled} | loaded={llm_loaded} | executed={llm_executed} | calls={llm_calls}
@@ -457,6 +462,10 @@ if evolution_summary:
     )
 if evolution_health_lines:
     md_text += "- evolution validity/robustness: " + "; ".join(evolution_health_lines) + "\n"
+if latest_family_telemetry:
+    md_text += "- latest generation family telemetry:\n"
+    for key in ("generated", "critic_rejected", "validation_failed", "scored", "robust", "survivor"):
+        md_text += f"  - {key}: {latest_family_telemetry.get(key, {})}\n"
 if "RUN_MANIFEST_FILE" in globals() and RUN_MANIFEST_FILE.exists():
     md_text += f"- run manifest: `{RUN_MANIFEST_FILE.name}`\n"
 if "EVOLUTION_PROGRAM_FILE" in globals() and EVOLUTION_PROGRAM_FILE.exists():
@@ -494,11 +503,25 @@ if search_robustness_line:
     md_text += f"- train robustness score summary: {search_robustness_line}\n"
 if evolution_health_lines:
     md_text += "- evolution zero-robust/valid-rate: " + "; ".join(evolution_health_lines) + "\n"
+failure_mode_notes = []
+if latest_family_telemetry:
+    generated_total = sum(int(v) for v in latest_family_telemetry.get("generated", {}).values())
+    scored_total = sum(int(v) for v in latest_family_telemetry.get("scored", {}).values())
+    if generated_total and scored_total / max(generated_total, 1) < 0.10:
+        failure_mode_notes.append("generator validity bottleneck")
+if generalization_gap is not None and generalization_gap > 0.50:
+    failure_mode_notes.append("scoring overfit / train-to-held-out gap")
+if evolution_test_edge is not None and evolution_test_edge < 0:
+    failure_mode_notes.append("no evolved held-out edge over deterministic baseline")
+if failure_mode_notes:
+    md_text += "- evolved failure mode diagnosis: " + "; ".join(failure_mode_notes) + "\n"
 md_text += f"- economic success gate: evolved Sh >= {economic_sharpe_floor:.2f} and edge >= {economic_edge_floor:+.2f}\n"
 md_text += (
     f"- approved held-out winner gate: highest composite score, edge >= {approved_winner_edge_floor:+.2f} "
     "vs best deterministic baseline, and must not lose a majority of supporting diagnostics\n"
 )
+if adaptive_diagnostic_run:
+    md_text += "- adaptive diagnostic caveat: this run may use lessons from the current held-out period, so it is not final scientific proof.\n"
 if adherence_notes:
     md_text += "- open issues: " + "; ".join(adherence_notes) + "\n"
 else:

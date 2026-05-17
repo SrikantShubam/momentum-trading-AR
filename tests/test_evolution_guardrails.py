@@ -47,6 +47,7 @@ def _load_parent_selection_namespace():
 
     ns["_top_parents_from_rows"] = top_parents
     ns["_diverse_top_parents_from_rows"] = top_parents
+    ns["_family_capped_rows"] = lambda rows, limit: list(rows[:limit])
     ns["_tournament_select"] = tournament
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(METRIC_CELL), "exec"), ns)
     return ns
@@ -274,12 +275,15 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertIn("EVOLVE_ZERO_ROBUST_PATIENCE = 3", metric_source)
         self.assertIn('EVOLVE_BENCHMARK_MUTATION = "regime_momentum"', metric_source)
         self.assertIn("EVOLVE_CHAMPION_VARIANTS", metric_source)
+        self.assertIn("EVOLVE_ADAPTIVE_DIAGNOSTIC_RUN = True", metric_source)
+        self.assertIn("EVOLVE_FAMILY_QUOTAS", metric_source)
+        self.assertIn("EVOLVE_PARENT_FAMILY_CAP = 0.40", metric_source)
         self.assertIn("EVOLVE_VAL_WF_FLOOR_PENALTY", metric_source)
         self.assertIn("_select_next_generation_parents", metric_source)
         self.assertIn("zero_robust_streak_reached", metric_source)
         self.assertNotIn("EVOLVE_MAX_GENERATIONS = 200", metric_source)
 
-    def test_evolution_defaults_favor_regime_momentum_and_single_component_search(self):
+    def test_evolution_repairs_search_collapse_with_family_quotas(self):
         metric_source = METRIC_CELL.read_text()
 
         self.assertIn("def _entry_variant_tags(entry):", metric_source)
@@ -290,11 +294,19 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertIn('stop_reason = "stagnation_reached"', metric_source)
         self.assertIn('deduped = {}', metric_source)
         self.assertIn('fallback_focus = ["regime_momentum", "volume_confirm", "volume_gate", "rank_norm", "plain", "regime_gate", "ts_momentum"]', metric_source)
-        self.assertIn('focus_variants = ["regime_momentum", "volume_confirm", "volume_gate", "rank_norm", "regime_gate"]', metric_source)
-        self.assertIn('n_comp = 1 if rng.random() < 0.88 else 2', metric_source)
+        self.assertIn('"volume_gate": 0.24', metric_source)
+        self.assertIn('"volume_confirm": 0.20', metric_source)
+        self.assertIn('"composite": 0.16', metric_source)
+        self.assertIn('for family, quota in quota_counts.items():', metric_source)
+        self.assertIn('f"family_quota:{family}"', metric_source)
+        self.assertIn("def _repair_program_after_failure(program, error_text, gen_program=None, rng=None):", metric_source)
+        self.assertIn('if "beta drift" in err:', metric_source)
+        self.assertIn('if "dead after market-neutral" in err or "not genuinely long-short" in err or "low signal activity" in err:', metric_source)
         self.assertIn('op_choices = ["tweak", "tweak", "tweak", "swap_variant", "swap_variant", "reweight", "add"]', metric_source)
         self.assertIn("def _diverse_top_parents_from_rows(rows, k):", metric_source)
         self.assertIn("for variant in EVOLVE_CHAMPION_VARIANTS:", metric_source)
+        self.assertIn("def _family_capped_rows(rows, limit, cap_frac=EVOLVE_PARENT_FAMILY_CAP):", metric_source)
+        self.assertIn("family_telemetry = _generation_family_telemetry(candidates, gen_rows, survivors)", metric_source)
         self.assertIn("- EVOLVE_VAL_WF_FLOOR_PENALTY * wf_floor_shortfall", metric_source)
         self.assertIn("val_wf_missing_penalty", metric_source)
         self.assertIn("sig_w = sig_core.iloc[lo:hi]", metric_source)
@@ -378,6 +390,10 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertIn('heldout_report_builder = globals().get("_build_heldout_report")', notebook_report)
         self.assertIn('heldout_rule_status = heldout_report.get("status", "no_winner_yet")', notebook_report)
         self.assertIn('heldout_has_approved_winner = bool(heldout_winner)', notebook_report)
+        self.assertIn('**Adaptive diagnostic run:** {adaptive_diagnostic_run}', notebook_report)
+        self.assertIn('latest generation family telemetry', notebook_report)
+        self.assertIn('adaptive diagnostic caveat', notebook_report)
+        self.assertIn('evolved failure mode diagnosis', notebook_report)
         notebook_heldout = next(src for src in cell_sources if src.startswith("TOP_K = 5\nHELDOUT_SHORTLIST_K = 20"))
         self.assertIn('trend_fast = close.pct_change({short_span})', notebook_heldout)
         self.assertIn('trend_slow = close.pct_change({long_span})', notebook_heldout)
@@ -394,7 +410,10 @@ class EvolutionGuardrailTests(unittest.TestCase):
 
         self.assertIn('RUN_LLM_STAGE            = _env_truthy(os.getenv("AUTORESEARCH_RUN_LLM_STAGE"), default=False)', config_source)
         self.assertIn('RUN_BNB_MODEL_LOAD       = _env_truthy(os.getenv("AUTORESEARCH_ENABLE_BNB_LOAD"), default=False)', config_source)
+        self.assertIn('RUN_LLM_SMOKE            = _env_truthy(os.getenv("AUTORESEARCH_RUN_LLM_SMOKE"), default=False)', config_source)
+        self.assertIn("REQUESTED_LLM_MODEL = bool(RUN_LLM_STAGE or RUN_MOE_STAGE or RUN_LLM_SMOKE)", model_source)
         self.assertIn("SHOULD_LOAD_LLM_MODEL = bool(REQUESTED_LLM_MODEL and RUN_BNB_MODEL_LOAD)", model_source)
+        self.assertIn("if RUN_LLM_SMOKE:", model_source)
         self.assertIn('LLM_LOAD_ERROR = "bnb_model_load_disabled"', model_source)
         self.assertIn("def _bnb_config():", model_source)
         self.assertNotIn("SHOULD_LOAD_LLM_MODEL = bool(RUN_LLM_STAGE or RUN_MOE_STAGE)", model_source)
@@ -407,6 +426,8 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertNotIn('ACTIVE_EXECUTION_SCOPE = "pure autoresearch only"', build_source)
         self.assertIn('RUN_LLM_STAGE   = _env_truthy(os.getenv("AUTORESEARCH_RUN_LLM_STAGE"), default=False)', build_source)
         self.assertIn('RUN_BNB_MODEL_LOAD = _env_truthy(os.getenv("AUTORESEARCH_ENABLE_BNB_LOAD"), default=False)', build_source)
+        self.assertIn('RUN_LLM_SMOKE = _env_truthy(os.getenv("AUTORESEARCH_RUN_LLM_SMOKE"), default=False)', build_source)
+        self.assertIn("REQUESTED_LLM_MODEL = bool(RUN_LLM_STAGE or RUN_MOE_STAGE or RUN_LLM_SMOKE)", build_source)
         self.assertIn("SHOULD_LOAD_LLM_MODEL = bool(REQUESTED_LLM_MODEL and RUN_BNB_MODEL_LOAD)", build_source)
 
 

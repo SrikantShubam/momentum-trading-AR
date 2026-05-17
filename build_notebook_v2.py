@@ -145,6 +145,7 @@ TRAIN_END       = "2022-12-31"
 RUN_LLM_STAGE   = _env_truthy(os.getenv("AUTORESEARCH_RUN_LLM_STAGE"), default=False)
 RUN_MOE_STAGE   = _env_truthy(os.getenv("AUTORESEARCH_RUN_MOE_STAGE"), default=False)
 RUN_BNB_MODEL_LOAD = _env_truthy(os.getenv("AUTORESEARCH_ENABLE_BNB_LOAD"), default=False)
+RUN_LLM_SMOKE = _env_truthy(os.getenv("AUTORESEARCH_RUN_LLM_SMOKE"), default=False)
 RUN_HELDOUT_EVAL = True
 RUN_REPORTS = True
 REFLECTION_ENABLED = bool(RUN_LLM_STAGE and REFLECT_EVERY > 0)
@@ -164,6 +165,7 @@ RUNTIME_STATE = {
     "actual_model_id": None,
     "llm_stage_enabled": bool(RUN_LLM_STAGE),
     "moe_stage_enabled": bool(RUN_MOE_STAGE),
+    "llm_smoke_enabled": bool(RUN_LLM_SMOKE),
     "llm_stage_loaded": False,
     "bnb_model_load_enabled": bool(RUN_BNB_MODEL_LOAD),
     "llm_stage_executed": False,
@@ -564,13 +566,14 @@ md("""## Cell 6 — Load model (4-bit quantised)
 The model load is lazy. If no LLM stage is enabled, this cell skips the
 bitsandbytes/CUDA path entirely so deterministic research can still run.
 """)
-code('''REQUESTED_LLM_MODEL = bool(RUN_LLM_STAGE or RUN_MOE_STAGE)
+code('''REQUESTED_LLM_MODEL = bool(RUN_LLM_STAGE or RUN_MOE_STAGE or RUN_LLM_SMOKE)
 SHOULD_LOAD_LLM_MODEL = bool(REQUESTED_LLM_MODEL and RUN_BNB_MODEL_LOAD)
 tok = None
 model = None
 update_runtime_state(
     llm_stage_enabled=bool(RUN_LLM_STAGE),
     moe_stage_enabled=bool(RUN_MOE_STAGE),
+    llm_smoke_enabled=bool(RUN_LLM_SMOKE),
     bnb_model_load_enabled=bool(RUN_BNB_MODEL_LOAD),
     llm_stage_loaded=False,
     llm_stage_executed=False,
@@ -653,6 +656,16 @@ def ensure_model_loaded():
 
 if SHOULD_LOAD_LLM_MODEL:
     ensure_model_loaded()
+    if RUN_LLM_SMOKE:
+        try:
+            smoke_ids = tok("LLM smoke test", return_tensors="pt").input_ids.to(model.device)
+            with torch.no_grad():
+                _ = model.generate(smoke_ids, max_new_tokens=1, do_sample=False, pad_token_id=tok.pad_token_id)
+            update_runtime_state(llm_smoke_executed=True, llm_smoke_ok=True)
+            print("LLM smoke test: OK")
+        except Exception as e:
+            update_runtime_state(llm_smoke_executed=True, llm_smoke_ok=False, llm_smoke_error=f"{type(e).__name__}: {e}")
+            print(f"LLM smoke test failed: {type(e).__name__}: {e}")
 else:
     if REQUESTED_LLM_MODEL:
         update_runtime_state(llm_load_strategy="skipped_bnb_disabled", llm_stage_error="bnb_model_load_disabled")

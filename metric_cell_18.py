@@ -54,6 +54,22 @@ EVOLVE_MIN_DIVERSITY_GAIN = 0.01
 EVOLVE_BENCHMARK_SOURCE = "deterministic"
 EVOLVE_BENCHMARK_MUTATION = "regime_momentum"
 EVOLVE_CHAMPION_VARIANTS = ["regime_momentum", "volume_gate", "volume_confirm", "rank_norm", "plain", "regime_gate", "ts_momentum"]
+EVOLVE_ADAPTIVE_DIAGNOSTIC_RUN = True
+EVOLVE_PARENT_FAMILY_CAP = 0.40
+EVOLVE_FAMILY_QUOTAS = {
+    "volume_gate": 0.24,
+    "volume_confirm": 0.20,
+    "regime_momentum": 0.20,
+    "rank_norm": 0.12,
+    "plain": 0.08,
+    "composite": 0.16,
+}
+EVOLVE_SAFE_COMPOSITE_PAIRS = [
+    ("volume_gate", "rank_norm"),
+    ("volume_confirm", "plain"),
+    ("volume_gate", "regime_gate"),
+    ("volume_confirm", "ts_momentum"),
+]
 EVOLVE_DIAGNOSIS_TOP_ROWS = 5
 VAL_FRACTION = 0.20
 EVAL_TIMEOUT_SEC = 25
@@ -231,6 +247,10 @@ def _evolution_policy_payload():
         "deterministic_champions": EVOLVE_DETERMINISTIC_CHAMPIONS,
         "economic_sharpe_floor": ECONOMIC_SHARPE_FLOOR,
         "economic_edge_over_deterministic": ECONOMIC_EDGE_OVER_DETERMINISTIC,
+        "adaptive_diagnostic_run": EVOLVE_ADAPTIVE_DIAGNOSTIC_RUN,
+        "family_quotas": dict(EVOLVE_FAMILY_QUOTAS),
+        "parent_family_cap": EVOLVE_PARENT_FAMILY_CAP,
+        "safe_composite_pairs": list(EVOLVE_SAFE_COMPOSITE_PAIRS),
         "max_total_evals": EVOLVE_MAX_TOTAL_EVALS,
         "max_wallclock_hours": EVOLVE_MAX_WALLCLOCK_HOURS,
         "train_val_firewall": True,
@@ -1447,6 +1467,53 @@ def _diverse_top_parents_from_rows(rows, k):
     return out[:k]
 
 
+def _program_variants(program):
+    comps = program.get("components", []) if isinstance(program, dict) else []
+    return [str(_sanitize_component(c).get("mutation_type", EVOLVE_BENCHMARK_MUTATION)) for c in comps]
+
+
+def _program_primary_family(program):
+    variants = _program_variants(program)
+    if len(variants) >= 2:
+        return "composite"
+    return variants[0] if variants else EVOLVE_BENCHMARK_MUTATION
+
+
+def _row_family(row):
+    if not isinstance(row, dict):
+        return "unknown"
+    if isinstance(row.get("program"), dict):
+        return _program_primary_family(row["program"])
+    return str(row.get("candidate_family") or row.get("mutation_type") or row.get("family") or "unknown")
+
+
+def _family_capped_rows(rows, limit, cap_frac=EVOLVE_PARENT_FAMILY_CAP):
+    rows = [r for r in rows or [] if isinstance(r, dict)]
+    if not rows or limit <= 0:
+        return []
+    cap = max(1, int(np.ceil(float(limit) * float(cap_frac))))
+    families = { _row_family(r) for r in rows }
+    if len(families) <= 1:
+        return rows[:limit]
+    selected = []
+    family_counts = {}
+    deferred = []
+    for row in rows:
+        fam = _row_family(row)
+        if family_counts.get(fam, 0) >= cap:
+            deferred.append(row)
+            continue
+        selected.append(row)
+        family_counts[fam] = family_counts.get(fam, 0) + 1
+        if len(selected) >= limit:
+            return selected
+    for row in deferred:
+        if len(selected) >= limit:
+            break
+        selected.append(row)
+    return selected[:limit]
+
+
 def _aux_candidates_for_variant(variant, base_params):
     base = normalize_aux_params(base_params)
     if variant == "regime_gate":
@@ -1863,6 +1930,63 @@ def _critic_assess_program(program):
     return {"ok": len(reject_issues) == 0, "issues": issues, "score_adjust": float(score_adj)}
 
 
+def _component_with_variant(template, variant):
+    c = dict(template or {})
+    c["mutation_type"] = variant
+    params = normalize_aux_params(c.get("params", {}))
+    if variant in ("volume_gate", "volume_confirm"):
+        params = {"vol_gate_window": int(params.get("vol_gate_window", 20))}
+    elif variant in ("regime_gate", "regime_momentum"):
+        params = {"vix_threshold": float(params.get("vix_threshold", 22.0))}
+    elif variant in ("vol_scale", "vol_adjusted", "multi_factor"):
+        params = {"vol_window": int(params.get("vol_window", 20))}
+    else:
+        params = {}
+    c["params"] = params
+    return _sanitize_component(c)
+
+
+def _repair_program_pre_eval(program, gen_program=None, rng=None):
+    rng = rng or random.Random(PARAM_SEARCH_SEED)
+    comps = [_sanitize_component(c) for c in (program or {}).get("components", [])]
+    if not comps:
+        comps = [_sanitize_component({"mutation_type": "volume_gate", "short_span": 60, "long_span": 105, "params": {"vol_gate_window": 20}, "weight": 1.0})]
+    if len(comps) > 2:
+        comps = comps[:2]
+    seen = set()
+    repaired = []
+    replacement_pool = ["volume_gate", "volume_confirm", "rank_norm", "plain", "regime_gate", "ts_momentum"]
+    for c in comps:
+        variant = c.get("mutation_type", EVOLVE_BENCHMARK_MUTATION)
+        if variant in seen:
+            variant = next((v for v in replacement_pool if v not in seen), "volume_gate")
+            c = _component_with_variant(c, variant)
+        seen.add(c.get("mutation_type", variant))
+        repaired.append(_sanitize_component(c))
+    return {"components": repaired}
+
+
+def _repair_program_after_failure(program, error_text, gen_program=None, rng=None):
+    err = str(error_text or "").lower()
+    comps = [_sanitize_component(c) for c in (program or {}).get("components", [])]
+    base = comps[0] if comps else {"short_span": 60, "long_span": 105, "weight": 1.0}
+    if "beta drift" in err:
+        repaired = _component_with_variant(base, "volume_gate")
+        repaired["params"] = {"vol_gate_window": int(repaired.get("params", {}).get("vol_gate_window", 20))}
+        return {"components": [_sanitize_component(repaired)]}
+    if "dead after market-neutral" in err or "not genuinely long-short" in err or "low signal activity" in err:
+        repaired = _component_with_variant(base, "volume_confirm")
+        repaired["params"] = {"vol_gate_window": int(repaired.get("params", {}).get("vol_gate_window", 20))}
+        return {"components": [_sanitize_component(repaired)]}
+    if "duplicate" in err or "bad_composite" in err:
+        a = _component_with_variant(base, "volume_gate")
+        b = _component_with_variant(base, "rank_norm")
+        b["short_span"] = int(max(36, min(66, int(b.get("short_span", 54)) - 3)))
+        b["long_span"] = int(max(b["short_span"] + 30, min(150, int(b.get("long_span", 90)) + 6)))
+        return _repair_program_pre_eval({"components": [a, b]}, gen_program=gen_program, rng=rng)
+    return None
+
+
 def _split_train_validation():
     n = len(close_train)
     n_val = max(int(n * VAL_FRACTION), 252)
@@ -2092,8 +2216,7 @@ def _candidate_programs(parents, gen_program, n_trials, rng):
     if not focus_variants:
         focus_variants = ["regime_momentum", "volume_confirm", "volume_gate", "rank_norm", "regime_gate"]
 
-    def _sample_component():
-        var = rng.choice(focus_variants)
+    def _sample_component_for_variant(var):
         ss = int(rng.randint(min_short, max_short))
         ls = int(rng.randint(max(min_long, ss + 30), max_long))
         params = {}
@@ -2113,6 +2236,56 @@ def _candidate_programs(parents, gen_program, n_trials, rng):
             }
         )
 
+    def _sample_component():
+        return _sample_component_for_variant(rng.choice(focus_variants))
+
+    def _quota_program(family):
+        if family == "composite":
+            a, b = rng.choice(EVOLVE_SAFE_COMPOSITE_PAIRS)
+            return {"components": [_sample_component_for_variant(a), _sample_component_for_variant(b)]}
+        return {"components": [_sample_component_for_variant(family)]}
+
+    def _add_candidate(prog, parent_meta, origin):
+        prog = _repair_program_pre_eval(prog, gen_program, rng)
+        _, sig, _ = _program_identity(prog)
+        if sig in seen:
+            return False
+        seen.add(sig)
+        candidates.append(
+            {
+                "program": prog,
+                "program_sig": sig,
+                "candidate_family": _program_primary_family(prog),
+                "parent_id": parent_meta.get("parent_id"),
+                "parent_signature": parent_meta.get("parent_signature"),
+                "parent_program_hash": parent_meta.get("parent_program_hash"),
+                "parent_score": parent_meta.get("parent_score"),
+                "origin": origin,
+            }
+        )
+        return True
+
+    quota_total = max(0, min(n_trials, int(round(n_trials * 0.65))))
+    quota_items = list(EVOLVE_FAMILY_QUOTAS.items())
+    quota_counts = {family: max(1, int(round(quota_total * frac))) for family, frac in quota_items}
+    while sum(quota_counts.values()) > quota_total and quota_counts:
+        family = max(quota_counts, key=lambda k: quota_counts[k])
+        quota_counts[family] -= 1
+    for family, quota in quota_counts.items():
+        if family not in allowed_variants and family != "composite":
+            continue
+        attempts = 0
+        while len(candidates) < n_trials and quota > 0 and attempts < max(quota * 20, 50):
+            attempts += 1
+            parent_meta = {
+                "parent_id": f"quota:{family}:g{gen_program.get('gen_id', 'unknown')}",
+                "parent_signature": None,
+                "parent_program_hash": None,
+                "parent_score": None,
+            }
+            if _add_candidate(_quota_program(family), parent_meta, f"family_quota:{family}"):
+                quota -= 1
+
     while len(candidates) < n_trials:
         parent_meta = {
             "parent_id": f"explore:g{gen_program.get('gen_id', 'unknown')}",
@@ -2128,20 +2301,7 @@ def _candidate_programs(parents, gen_program, n_trials, rng):
             parent_meta = parent_records[rng.randrange(0, len(parent_records))]
             parent_prog = parent_meta["program"]
             prog = _mutate_program(parent_prog, gen_program, rng)
-        _, sig, _ = _program_identity(prog)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        candidates.append(
-            {
-                "program": prog,
-                "program_sig": sig,
-                "parent_id": parent_meta.get("parent_id"),
-                "parent_signature": parent_meta.get("parent_signature"),
-                "parent_program_hash": parent_meta.get("parent_program_hash"),
-                "parent_score": parent_meta.get("parent_score"),
-            }
-        )
+        _add_candidate(prog, parent_meta, "program_mutation")
         if len(seen) > max(n_trials * 60, 20000):
             break
     return candidates
@@ -2194,6 +2354,7 @@ def _tournament_select(rows, k_survivors, rng):
     pool = [r for r in rows if r.get("robust_ok") and r.get("score") is not None]
     if not pool:
         pool = [r for r in rows if r.get("score") is not None]
+    original_pool = list(pool)
     selected = []
     used = set()
     used_clusters = set()
@@ -2235,7 +2396,7 @@ def _tournament_select(rows, k_survivors, rng):
             used_clusters.add(cid)
         selected.append(best)
         pool = [p for p in pool if p is not best]
-    return selected
+    return _family_capped_rows(selected + [p for p in original_pool if p not in selected], k_survivors)
 
 
 def _merge_parent_candidates(*groups, limit):
@@ -2254,9 +2415,7 @@ def _merge_parent_candidates(*groups, limit):
                 continue
             seen.add(ident)
             merged.append(row)
-            if len(merged) >= limit:
-                return merged
-    return merged
+    return _family_capped_rows(merged, limit)
 
 
 def _select_next_generation_parents(current_parents, valid, robust, global_rows, rng):
@@ -2277,6 +2436,41 @@ def _select_next_generation_parents(current_parents, valid, robust, global_rows,
     else:
         parents = list(current_parents or [])
     return parents, survivors, did_reseed
+
+
+def _inc_count(mapping, key, n=1):
+    key = str(key or "unknown")
+    mapping[key] = int(mapping.get(key, 0)) + int(n)
+
+
+def _generation_family_telemetry(candidates, rows, survivors):
+    telemetry = {
+        "generated": {},
+        "critic_rejected": {},
+        "validation_failed": {},
+        "scored": {},
+        "robust": {},
+        "survivor": {},
+        "failure_reasons": {},
+    }
+    for cand in candidates or []:
+        _inc_count(telemetry["generated"], cand.get("candidate_family") or _program_primary_family(cand.get("program", {})))
+    for row in rows or []:
+        fam = _row_family(row)
+        err = row.get("error")
+        if row.get("score") is not None:
+            _inc_count(telemetry["scored"], fam)
+            if row.get("robust_ok"):
+                _inc_count(telemetry["robust"], fam)
+        elif err:
+            bucket = "critic_rejected" if str(err).startswith("critic_reject:") else "validation_failed"
+            _inc_count(telemetry[bucket], fam)
+            reason = str(err).split(":", 1)[0] if ":" in str(err) else str(err)
+            reason_map = telemetry["failure_reasons"].setdefault(fam, {})
+            _inc_count(reason_map, reason)
+    for row in survivors or []:
+        _inc_count(telemetry["survivor"], _row_family(row))
+    return telemetry
 
 
 def run_evolution_search():
@@ -2358,30 +2552,63 @@ def run_evolution_search():
         for cand in candidates:
             critique = _critic_assess_program(cand["program"])
             if not critique["ok"]:
-                program_payload, program_hash, program_cluster = _program_identity(cand["program"])
-                gen_rows.append(
-                    {
-                        "source": "parameter_search_evolution",
-                        "family": "program_evolution",
-                        "base_family": "program_evolution",
-                        "error": "critic_reject:" + ",".join(critique["issues"]),
-                        "gen_id": gen_id,
-                        "parent_id": cand.get("parent_id") or f"unknown:g{gen_id}",
-                        "parent_signature": cand.get("parent_signature"),
-                        "parent_program_hash": cand.get("parent_program_hash"),
-                        "program_sig": cand.get("program_sig"),
-                        "program_hash": program_hash,
-                        "cluster_id": program_cluster,
-                        "program": cand["program"],
-                        "program_components": program_payload,
-                        "origin": cand.get("origin", "program_mutation"),
-                    }
+                repaired_program = _repair_program_after_failure(
+                    cand["program"],
+                    "critic_reject:" + ",".join(critique["issues"]),
+                    gen_program=gen_program,
+                    rng=rng,
                 )
-                continue
+                if repaired_program is not None:
+                    repaired_payload, repaired_hash, _ = _program_identity(repaired_program)
+                    if repaired_hash != cand.get("program_sig"):
+                        cand["program"] = repaired_program
+                        cand["program_sig"] = repaired_hash
+                        cand["candidate_family"] = _program_primary_family(repaired_program)
+                        cand["repair_applied"] = "critic_pre_eval"
+                        critique = _critic_assess_program(cand["program"])
+                if not critique["ok"]:
+                    program_payload, program_hash, program_cluster = _program_identity(cand["program"])
+                    primary_family = _program_primary_family(cand["program"])
+                    gen_rows.append(
+                        {
+                            "source": "parameter_search_evolution",
+                            "family": "program_evolution",
+                            "base_family": "program_evolution",
+                            "mutation_type": primary_family,
+                            "candidate_family": cand.get("candidate_family", primary_family),
+                            "error": "critic_reject:" + ",".join(critique["issues"]),
+                            "gen_id": gen_id,
+                            "parent_id": cand.get("parent_id") or f"unknown:g{gen_id}",
+                            "parent_signature": cand.get("parent_signature"),
+                            "parent_program_hash": cand.get("parent_program_hash"),
+                            "program_sig": cand.get("program_sig"),
+                            "program_hash": program_hash,
+                            "cluster_id": program_cluster,
+                            "program": cand["program"],
+                            "program_components": program_payload,
+                            "origin": cand.get("origin", "program_mutation"),
+                            "repair_applied": cand.get("repair_applied"),
+                        }
+                    )
+                    continue
             row = _eval_program_trial(cand["program"], eval_context)
+            if row.get("score") is None and row.get("error"):
+                repaired_program = _repair_program_after_failure(cand["program"], row.get("error"), gen_program=gen_program, rng=rng)
+                if repaired_program is not None:
+                    repaired_payload, repaired_hash, _ = _program_identity(repaired_program)
+                    if repaired_hash != cand.get("program_sig"):
+                        repaired_row = _eval_program_trial(repaired_program, eval_context)
+                        repaired_row["repair_source_error"] = row.get("error")
+                        repaired_row["repair_applied"] = "failure_repair"
+                        cand["program"] = repaired_program
+                        cand["program_sig"] = repaired_hash
+                        cand["candidate_family"] = _program_primary_family(repaired_program)
+                        row = repaired_row
             row.setdefault("source", "parameter_search_evolution")
             row.setdefault("family", "program_evolution")
             row.setdefault("base_family", "program_evolution")
+            row["mutation_type"] = row.get("mutation_type") or _program_primary_family(cand["program"])
+            row["candidate_family"] = cand.get("candidate_family", _program_primary_family(cand["program"]))
             row["gen_id"] = gen_id
             row["parent_id"] = cand.get("parent_id") or row.get("parent_id") or f"unknown:g{gen_id}"
             row["parent_signature"] = cand.get("parent_signature")
@@ -2433,6 +2660,7 @@ def run_evolution_search():
                         cors.append(abs(float(c)))
             diversity = float(1.0 - np.mean(cors)) if cors else 0.0
 
+        family_telemetry = _generation_family_telemetry(candidates, gen_rows, survivors)
         best_gain = 0.0 if prev_best <= -1e8 else float(best_score - prev_best)
         median_gain = 0.0 if prev_median <= -1e8 else float(med_score - prev_median)
         diversity_gain = float(diversity - prev_div)
@@ -2485,7 +2713,10 @@ def run_evolution_search():
             "score_ci_90": [ci_lo, ci_hi],
             "survivor_count": len(survivors),
             "survivor_signatures": [s.get("signature") for s in survivors],
+            "survivor_families": family_telemetry.get("survivor", {}),
+            "family_telemetry": family_telemetry,
             "program_focus_variants": list(gen_program.get("focus_variants", [])),
+            "adaptive_diagnostic_run": bool(EVOLVE_ADAPTIVE_DIAGNOSTIC_RUN),
         }
         gen_diagnoses = _generation_diagnosis_events(generation_payload, valid, robust, benchmark_row=benchmark_row)
         generation_payload["diagnoses"] = gen_diagnoses
