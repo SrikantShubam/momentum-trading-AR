@@ -79,6 +79,9 @@ EVOLVE_DETERMINISTIC_CHAMPIONS = 12
 EVOLVE_COMPLEXITY_PENALTY = 0.025
 EVOLVE_TRAIN_VAL_GAP_PENALTY = 1.25
 EVOLVE_VOL_SCALE_PENALTY = 0.015
+EVOLVE_BETA_EXCESS_PENALTY = 8.00
+EVOLVE_TRAIN_WF_MIN_FLOOR = -0.20
+EVOLVE_TRAIN_WF_MIN_PENALTY = 3.00
 ECONOMIC_SHARPE_FLOOR = 0.50
 ECONOMIC_EDGE_OVER_DETERMINISTIC = 0.05
 EVOLUTION_SUMMARY_FILE = OUT / "evolution_summary.json"
@@ -244,6 +247,9 @@ def _evolution_policy_payload():
         "complexity_penalty": EVOLVE_COMPLEXITY_PENALTY,
         "train_val_gap_penalty": EVOLVE_TRAIN_VAL_GAP_PENALTY,
         "vol_scale_penalty": EVOLVE_VOL_SCALE_PENALTY,
+        "beta_excess_penalty": EVOLVE_BETA_EXCESS_PENALTY,
+        "train_wf_min_floor": EVOLVE_TRAIN_WF_MIN_FLOOR,
+        "train_wf_min_penalty": EVOLVE_TRAIN_WF_MIN_PENALTY,
         "robustness_score_floor": ROBUSTNESS_SCORE_FLOOR,
         "deterministic_champions": EVOLVE_DETERMINISTIC_CHAMPIONS,
         "economic_sharpe_floor": ECONOMIC_SHARPE_FLOOR,
@@ -2098,9 +2104,13 @@ def _eval_program_trial(program, context):
     raw_val_score = evolution_score(val_sh, val_wf_median, val_wf_min, val_cons, beta_val, to_val)
     val_score = raw_val_score
     val_wf_missing_penalty = EVOLVE_VAL_WF_MISSING_PENALTY if val_wf_count < 2 else 0.0
+    beta_excess_penalty = EVOLVE_BETA_EXCESS_PENALTY * max(0.0, abs(beta_val) - BETA_LIMIT)
+    train_wf_min_penalty = EVOLVE_TRAIN_WF_MIN_PENALTY * max(0.0, EVOLVE_TRAIN_WF_MIN_FLOOR - wf_min)
     val_score -= EVOLVE_COMPLEXITY_PENALTY * max(0, n_components - 1)
     val_score -= EVOLVE_VOL_SCALE_PENALTY if has_vol_scale else 0.0
     val_score -= val_wf_missing_penalty
+    val_score -= beta_excess_penalty
+    val_score -= train_wf_min_penalty
     val_score -= EVOLVE_TRAIN_VAL_GAP_PENALTY * max(0.0, train_score - raw_val_score)
     robustness_payload = {
         "train_sharpe": val_sh,
@@ -2166,6 +2176,11 @@ def _eval_program_trial(program, context):
         "val_wf_min": val_wf_min,
         "val_wf_count": val_wf_count,
         "beta": beta_val,
+        "beta_neutralized": beta_neutralized,
+        "beta_raw": beta_raw,
+        "beta_neutralized_value": beta_val,
+        "beta_reduction": beta_reduction,
+        "beta_gate_status": beta_gate_status,
         "turnover": to_val,
         "max_dd": max_dd_val,
         "score_train": train_score,
@@ -2173,6 +2188,8 @@ def _eval_program_trial(program, context):
         "score_val": val_score,
         "complexity_penalty": EVOLVE_COMPLEXITY_PENALTY * max(0, n_components - 1),
         "val_wf_missing_penalty": val_wf_missing_penalty,
+        "beta_excess_penalty": beta_excess_penalty,
+        "train_wf_min_penalty": train_wf_min_penalty,
         "train_val_gap_penalty": EVOLVE_TRAIN_VAL_GAP_PENALTY * max(0.0, train_score - raw_val_score),
         "score": val_score,
         "robustness_score": program_robustness_score,
@@ -2491,6 +2508,15 @@ def _generation_family_telemetry(candidates, rows, survivors):
     return telemetry
 
 
+def _should_stop_for_zero_robust(gen_id, zero_robust_streak, valid_rate):
+    """Stop only when zero-robust also indicates generator validity collapse."""
+    return bool(
+        gen_id >= EVOLVE_ZERO_ROBUST_MIN_GENERATIONS
+        and zero_robust_streak >= EVOLVE_ZERO_ROBUST_PATIENCE
+        and float(valid_rate or 0.0) < EVOLVE_ZERO_ROBUST_MIN_VALID_RATE
+    )
+
+
 def run_evolution_search():
     all_rows = []
     generations = []
@@ -2643,7 +2669,7 @@ def run_evolution_search():
         valid = [r for r in gen_rows if r.get("score") is not None]
         robust = [r for r in valid if r.get("robust_ok")]
         valid_rate = float(len(valid) / len(gen_rows)) if gen_rows else 0.0
-        zero_robust_counted = len(robust) == 0 and valid_rate >= EVOLVE_ZERO_ROBUST_MIN_VALID_RATE
+        zero_robust_counted = len(robust) == 0
         zero_robust_streak = zero_robust_streak + 1 if zero_robust_counted else 0
         parents, survivors, did_reseed = _select_next_generation_parents(parents, valid, robust, global_rows, rng)
         if did_reseed:
@@ -2768,7 +2794,7 @@ def run_evolution_search():
         generations.append(generation_payload)
 
         stop_after_generation = False
-        if gen_id >= EVOLVE_ZERO_ROBUST_MIN_GENERATIONS and zero_robust_streak >= EVOLVE_ZERO_ROBUST_PATIENCE:
+        if _should_stop_for_zero_robust(gen_id, zero_robust_streak, valid_rate):
             stop_reason = "zero_robust_streak_reached"
             stop_after_generation = True
         elif gen_id >= EVOLVE_MIN_GENERATIONS and best_so_far_streak >= EVOLVE_HARD_STAGNATION_PATIENCE:

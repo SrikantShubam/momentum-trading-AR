@@ -95,6 +95,29 @@ def _load_diagnosis_namespace():
     return ns
 
 
+def _load_stop_policy_namespace():
+    keep = {"_should_stop_for_zero_robust"}
+    nodes = []
+    for node in _module_ast().body:
+        if isinstance(node, ast.Assign):
+            if any(
+                isinstance(t, ast.Name)
+                and t.id in {
+                    "EVOLVE_ZERO_ROBUST_PATIENCE",
+                    "EVOLVE_ZERO_ROBUST_MIN_GENERATIONS",
+                    "EVOLVE_ZERO_ROBUST_MIN_VALID_RATE",
+                }
+                for t in node.targets
+            ):
+                nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in keep:
+            nodes.append(node)
+
+    ns = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(METRIC_CELL), "exec"), ns)
+    return ns
+
+
 def _load_backtest_namespace():
     ns = {"np": np, "pd": pd}
     exec(compile(BACKTEST_CELL.read_text(), str(BACKTEST_CELL), "exec"), ns)
@@ -135,7 +158,7 @@ class EvolutionGuardrailTests(unittest.TestCase):
         )
         self.assertNotIn("bad-a", [row["parent_id"] for row in parents[:2]])
 
-    def test_zero_robust_guardrails_fail_fast(self):
+    def test_zero_robust_guardrails_do_not_stop_when_validity_is_healthy(self):
         constants = _constant_assignments(
             [
                 "EVOLVE_MAX_GENERATIONS",
@@ -155,11 +178,16 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertLessEqual(constants["EVOLVE_MAX_WALLCLOCK_HOURS"], 2.0)
         self.assertLessEqual(constants["EVOLVE_STAGNATION_PATIENCE"], 3)
         self.assertLessEqual(constants["EVOLVE_HARD_STAGNATION_PATIENCE"], 6)
-        self.assertLessEqual(constants["EVOLVE_ZERO_ROBUST_PATIENCE"], 3)
+        self.assertGreaterEqual(constants["EVOLVE_ZERO_ROBUST_PATIENCE"], 3)
         self.assertLessEqual(constants["EVOLVE_ZERO_ROBUST_MIN_GENERATIONS"], 3)
         self.assertLessEqual(constants["EVOLVE_ZERO_ROBUST_MIN_VALID_RATE"], 0.05)
         self.assertEqual(constants["EVOLVE_BENCHMARK_SOURCE"], "deterministic")
         self.assertEqual(constants["EVOLVE_BENCHMARK_MUTATION"], "regime_momentum")
+
+        ns = _load_stop_policy_namespace()
+        should_stop = ns["_should_stop_for_zero_robust"]
+        self.assertFalse(should_stop(gen_id=3, zero_robust_streak=3, valid_rate=0.98))
+        self.assertTrue(should_stop(gen_id=3, zero_robust_streak=3, valid_rate=0.01))
 
     def test_evolution_policy_payload_exposes_benchmark_and_stagnation_metadata(self):
         ns = _load_diagnosis_namespace()
@@ -365,6 +393,18 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertIn('"beta_raw": beta_raw', metric_source)
         self.assertIn('"beta_neutralized_value": beta_val', metric_source)
         self.assertIn('"beta_reduction": beta_reduction', metric_source)
+
+    def test_evolution_score_penalizes_residual_beta_and_walk_forward_tail_risk(self):
+        metric_source = METRIC_CELL.read_text()
+
+        self.assertIn("EVOLVE_BETA_EXCESS_PENALTY", metric_source)
+        self.assertIn("EVOLVE_TRAIN_WF_MIN_PENALTY", metric_source)
+        self.assertIn("beta_excess_penalty = EVOLVE_BETA_EXCESS_PENALTY", metric_source)
+        self.assertIn("train_wf_min_penalty = EVOLVE_TRAIN_WF_MIN_PENALTY", metric_source)
+        self.assertIn("val_score -= beta_excess_penalty", metric_source)
+        self.assertIn("val_score -= train_wf_min_penalty", metric_source)
+        self.assertIn('"beta_excess_penalty": beta_excess_penalty', metric_source)
+        self.assertIn('"train_wf_min_penalty": train_wf_min_penalty', metric_source)
 
     def test_beta_drift_repair_does_not_convert_everything_to_volume_gate(self):
         metric_source = METRIC_CELL.read_text()
