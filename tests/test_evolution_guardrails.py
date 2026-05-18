@@ -3,8 +3,12 @@ import json
 from pathlib import Path
 import unittest
 
+import numpy as np
+import pandas as pd
+
 
 ROOT = Path(__file__).resolve().parents[1]
+BACKTEST_CELL = ROOT / "metric_cell_8.py"
 METRIC_CELL = ROOT / "metric_cell_18.py"
 HELDOUT_CELL = ROOT / "metric_cell_24.py"
 REPORT_CELL = ROOT / "metric_cell_28.py"
@@ -91,6 +95,12 @@ def _load_diagnosis_namespace():
     return ns
 
 
+def _load_backtest_namespace():
+    ns = {"np": np, "pd": pd}
+    exec(compile(BACKTEST_CELL.read_text(), str(BACKTEST_CELL), "exec"), ns)
+    return ns
+
+
 class EvolutionGuardrailTests(unittest.TestCase):
     def test_reseeded_robust_parents_are_not_overwritten_by_nonrobust_survivors(self):
         ns = _load_parent_selection_namespace()
@@ -158,6 +168,8 @@ class EvolutionGuardrailTests(unittest.TestCase):
 
         self.assertEqual(policy["stagnation_patience"], ns["EVOLVE_STAGNATION_PATIENCE"])
         self.assertEqual(policy["benchmark_policy"]["source"], "deterministic")
+        self.assertEqual(policy["benchmark_policy"]["anchor"], "best_deterministic_by_train_score")
+        self.assertEqual(policy["benchmark_policy"]["fallback_seed_mutation_type"], "regime_momentum")
         self.assertIn("selection_objective", policy["benchmark_policy"])
         self.assertIn("economic_edge_over_deterministic", policy["benchmark_policy"])
 
@@ -311,6 +323,68 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertIn("val_wf_missing_penalty", metric_source)
         self.assertIn("sig_w = sig_core.iloc[lo:hi]", metric_source)
         self.assertIn("sig_w = sig_val.iloc[lo:hi]", metric_source)
+
+    def test_shared_backtest_uses_lagged_beta_neutral_position_construction(self):
+        backtest_source = BACKTEST_CELL.read_text()
+
+        self.assertIn("BETA_NEUTRALIZE_POSITIONS = True", backtest_source)
+        self.assertIn("BETA_NEUTRAL_LOOKBACK = 126", backtest_source)
+        self.assertIn("def _rolling_asset_betas(close_df, lookback=BETA_NEUTRAL_LOOKBACK):", backtest_source)
+        self.assertIn(".shift(1)", backtest_source)
+        self.assertIn("def _beta_neutralize_positions(pos, close_df):", backtest_source)
+        self.assertIn("beta_exposure = (centered * betas).sum(axis=1)", backtest_source)
+        self.assertIn('"beta_neutralized"', backtest_source)
+        self.assertIn('"beta_raw"', backtest_source)
+
+    def test_beta_neutralization_reduces_synthetic_market_beta_without_mutating_signal(self):
+        ns = _load_backtest_namespace()
+        rng = np.random.default_rng(7)
+        dates = pd.bdate_range("2020-01-01", periods=420)
+        columns = ["low_beta_a", "low_beta_b", "high_beta_a", "high_beta_b"]
+        beta_vec = pd.Series([-1.0, -0.4, 0.8, 1.6], index=columns)
+        market = pd.Series(rng.normal(0.0005, 0.012, len(dates)), index=dates)
+        noise = pd.DataFrame(rng.normal(0.0, 0.002, (len(dates), len(columns))), index=dates, columns=columns)
+        returns = noise.add(market.values[:, None] * beta_vec.values, axis=1)
+        close = 100.0 * (1.0 + returns).cumprod()
+        signal = pd.DataFrame(np.tile(beta_vec.values, (len(dates), 1)), index=dates, columns=columns)
+        before = signal.copy(deep=True)
+
+        metrics = ns["backtest"](signal, close, cost_bps=0.0)
+
+        pd.testing.assert_frame_equal(signal, before)
+        self.assertTrue(metrics["beta_neutralized"])
+        self.assertLess(abs(metrics["beta_neutralized_value"]), abs(metrics["beta_raw"]))
+        self.assertGreater(metrics["beta_reduction"], 0.0)
+
+    def test_evolution_scores_beta_drift_instead_of_censoring_volume_families(self):
+        metric_source = METRIC_CELL.read_text()
+
+        self.assertNotIn("SIGNAL_VALIDATION: beta drift before walk-forward", metric_source)
+        self.assertIn('beta_gate_status = "scored_beta_high"', metric_source)
+        self.assertIn('"beta_gate_status": beta_gate_status', metric_source)
+        self.assertIn('"beta_raw": beta_raw', metric_source)
+        self.assertIn('"beta_neutralized_value": beta_val', metric_source)
+        self.assertIn('"beta_reduction": beta_reduction', metric_source)
+
+    def test_beta_drift_repair_does_not_convert_everything_to_volume_gate(self):
+        metric_source = METRIC_CELL.read_text()
+
+        self.assertIn('if "beta drift" in err:', metric_source)
+        self.assertIn("return None", metric_source[metric_source.index('if "beta drift" in err:'):metric_source.index('if "dead after market-neutral" in err')])
+        self.assertNotIn('repaired = _component_with_variant(base, "volume_gate")\n        repaired["params"]', metric_source)
+
+    def test_notebook_backtest_cell_matches_beta_neutral_construction(self):
+        nb = json.loads(NOTEBOOK.read_text())
+        cell_sources = [
+            "".join(cell.get("source", ""))
+            for cell in nb["cells"]
+            if cell.get("cell_type") == "code"
+        ]
+        backtest_source = next(src for src in cell_sources if "def backtest(signal_df, close_df" in src and "signal_quality" in src)
+
+        self.assertIn("BETA_NEUTRALIZE_POSITIONS = True", backtest_source)
+        self.assertIn("def _rolling_asset_betas(close_df, lookback=BETA_NEUTRAL_LOOKBACK):", backtest_source)
+        self.assertIn("def _beta_neutralize_positions(pos, close_df):", backtest_source)
 
     def test_heldout_export_preserves_program_evolution_code(self):
         heldout_source = HELDOUT_CELL.read_text()

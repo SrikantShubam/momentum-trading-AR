@@ -8,6 +8,7 @@ Current guarded stage:
   - thread-based sandbox timeout
 """
 import json
+from pathlib import Path
 import nbformat
 from nbformat.validator import normalize
 
@@ -1406,6 +1407,19 @@ nb = {
     },
     "cells": CELLS,
 }
+
+cell_source_replacements = [
+    ("metric_cell_8.py", lambda src: "def _series_metrics(series):" in src and "def backtest(signal_df" in src),
+    ("metric_cell_18.py", lambda src: src.startswith("BASELINE_RESULTS = []") and "def selection_score" in src),
+    ("metric_cell_28.py", lambda src: "## AutoResearch Adherence" in src and "heldout_rule_status" in src),
+]
+for c in nb["cells"]:
+    src = c.get("source", "")
+    src_text = src if isinstance(src, str) else "".join(src)
+    for filename, predicate in cell_source_replacements:
+        if predicate(src_text):
+            c["source"] = Path(filename).read_text(encoding="utf-8").rstrip()
+            break
 
 # normalise source to list[str] (ipynb format)
 for c in nb["cells"]:

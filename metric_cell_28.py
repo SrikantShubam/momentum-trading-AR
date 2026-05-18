@@ -464,7 +464,7 @@ if evolution_health_lines:
     md_text += "- evolution validity/robustness: " + "; ".join(evolution_health_lines) + "\n"
 if latest_family_telemetry:
     md_text += "- latest generation family telemetry:\n"
-    for key in ("generated", "critic_rejected", "validation_failed", "scored", "robust", "survivor"):
+    for key in ("generated", "critic_rejected", "validation_failed", "scored", "scored_beta_high", "robust", "survivor"):
         md_text += f"  - {key}: {latest_family_telemetry.get(key, {})}\n"
 if "RUN_MANIFEST_FILE" in globals() and RUN_MANIFEST_FILE.exists():
     md_text += f"- run manifest: `{RUN_MANIFEST_FILE.name}`\n"

@@ -1,3 +1,9 @@
+BETA_NEUTRALIZE_POSITIONS = True
+BETA_NEUTRAL_LOOKBACK = 126
+BETA_NEUTRAL_MIN_PERIODS = 40
+BETA_NEUTRAL_EPS = 1e-10
+
+
 def _coerce_signal(signal_df, close_df):
     """Coerce candidate output into a numeric frame aligned to prices."""
     sig = signal_df.copy()
@@ -22,12 +28,45 @@ def signal_quality(signal_df, close_df):
     }
 
 
-def _market_neutral_positions(signal_df, close_df):
+def _unit_gross_positions(centered):
+    gross = centered.abs().sum(axis=1).replace(0.0, np.nan)
+    return centered.div(gross, axis=0).fillna(0.0)
+
+
+def _rolling_asset_betas(close_df, lookback=BETA_NEUTRAL_LOOKBACK):
+    """Estimate per-asset beta using only returns available before each signal date."""
+    ret = close_df.pct_change().fillna(0.0)
+    bench = ret.mean(axis=1)
+    min_periods = min(BETA_NEUTRAL_MIN_PERIODS, int(lookback))
+    asset_mean = ret.rolling(lookback, min_periods=min_periods).mean()
+    bench_mean = bench.rolling(lookback, min_periods=min_periods).mean()
+    cov = ret.mul(bench, axis=0).rolling(lookback, min_periods=min_periods).mean()
+    cov = cov - asset_mean.mul(bench_mean, axis=0)
+    var = bench.pow(2).rolling(lookback, min_periods=min_periods).mean() - bench_mean.pow(2)
+    betas = cov.div(var.replace(0.0, np.nan), axis=0)
+    return betas.shift(1).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-5.0, 5.0)
+
+
+def _beta_neutralize_positions(pos, close_df):
+    """Project daily weights away from lagged equal-weight market beta."""
+    centered = pos.sub(pos.mean(axis=1), axis=0)
+    betas = _rolling_asset_betas(close_df).reindex_like(centered).fillna(0.0)
+    beta_exposure = (centered * betas).sum(axis=1)
+    beta_norm = betas.pow(2).sum(axis=1).replace(0.0, np.nan)
+    hedge = betas.mul(beta_exposure.div(beta_norm).fillna(0.0), axis=0)
+    adjusted = centered - hedge
+    adjusted = adjusted.sub(adjusted.mean(axis=1), axis=0)
+    return _unit_gross_positions(adjusted)
+
+
+def _market_neutral_positions(signal_df, close_df, beta_neutralize=BETA_NEUTRALIZE_POSITIONS):
     """Convert raw scores to dollar-neutral unit-gross weights per date."""
     raw = _coerce_signal(signal_df, close_df)
     centered = raw.sub(raw.mean(axis=1), axis=0)
-    gross = centered.abs().sum(axis=1).replace(0.0, np.nan)
-    return centered.div(gross, axis=0).fillna(0.0)
+    pos = _unit_gross_positions(centered)
+    if beta_neutralize:
+        return _beta_neutralize_positions(pos, close_df)
+    return pos
 
 
 def _series_metrics(series):
@@ -61,10 +100,13 @@ def backtest(signal_df, close_df, cost_bps=1.0):
     # cross-sectional, market-neutral predictions. This closes the loophole
     # where all-long signals scored as equity beta.
     quality = signal_quality(signal_df, close_df)
+    raw_sig = _market_neutral_positions(signal_df, close_df, beta_neutralize=False)
     sig = _market_neutral_positions(signal_df, close_df)
     pos = sig.shift(1).fillna(0.0)
+    raw_pos = raw_sig.shift(1).fillna(0.0)
     ret = close_df.pct_change().fillna(0.0)
 
+    raw_gross = (raw_pos * ret).sum(axis=1)
     gross = (pos * ret).sum(axis=1)
     turnover = 0.5 * pos.diff().abs().sum(axis=1).fillna(0.0)
     cost = turnover * (cost_bps / 10000.0)
@@ -87,6 +129,10 @@ def backtest(signal_df, close_df, cost_bps=1.0):
         beta = float(np.cov(net, bench)[0, 1] / np.var(bench))
     else:
         beta = 0.0
+    if bench.std() > 0 and raw_gross.std() > 0:
+        beta_raw = float(np.cov(raw_gross, bench)[0, 1] / np.var(bench))
+    else:
+        beta_raw = 0.0
     if bench.std() > 0 and inv_net.std() > 0:
         beta_inv = float(np.cov(inv_net, bench)[0, 1] / np.var(bench))
     else:
@@ -101,6 +147,10 @@ def backtest(signal_df, close_df, cost_bps=1.0):
         "hit_rate": hit,
         "avg_turnover": float(turnover.mean()),
         "beta": beta,
+        "beta_neutralized": bool(BETA_NEUTRALIZE_POSITIONS),
+        "beta_raw": beta_raw,
+        "beta_neutralized_value": beta,
+        "beta_reduction": float(abs(beta_raw) - abs(beta)),
         "consistency": consistency,
         "annual_sharpes": annual_sharpes,
         "min_annual": min_annual,

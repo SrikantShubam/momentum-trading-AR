@@ -211,7 +211,8 @@ def _best_score_from_rows(rows):
 def _benchmark_policy_payload():
     return {
         "source": EVOLVE_BENCHMARK_SOURCE,
-        "anchor_mutation_type": EVOLVE_BENCHMARK_MUTATION,
+        "anchor": "best_deterministic_by_train_score",
+        "fallback_seed_mutation_type": EVOLVE_BENCHMARK_MUTATION,
         "selection_objective": SELECTION_OBJECTIVE,
         "deterministic_champions": EVOLVE_DETERMINISTIC_CHAMPIONS,
         "economic_sharpe_floor": ECONOMIC_SHARPE_FLOOR,
@@ -416,6 +417,14 @@ def _run_flags_payload():
     }
 
 
+def _portfolio_construction_payload():
+    return {
+        "beta_neutralize_positions": bool(globals().get("BETA_NEUTRALIZE_POSITIONS", False)),
+        "beta_lookback": int(globals().get("BETA_NEUTRAL_LOOKBACK", 0) or 0),
+        "beta_shifted": True,
+    }
+
+
 def _evolution_summary_payload(all_rows, generations, total_evals, stop_reason, diagnosis_events=None, partial=False, started=None):
     latest = generations[-1] if generations else {}
     diagnosis_events = list(diagnosis_events or [])
@@ -425,6 +434,7 @@ def _evolution_summary_payload(all_rows, generations, total_evals, stop_reason, 
         "artifact_status": "partial" if partial else "final",
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "policy": _evolution_policy_payload(),
+        "portfolio_construction": _portfolio_construction_payload(),
         "stop_reason": stop_reason,
         "generations_executed": len(generations),
         "total_evals": int(total_evals),
@@ -460,6 +470,7 @@ def _run_manifest_payload(all_rows, generations, total_evals, stop_reason, diagn
         "python_version": sys.version,
         "selection_objective": SELECTION_OBJECTIVE,
         "benchmark_policy": _benchmark_policy_payload(),
+        "portfolio_construction": _portfolio_construction_payload(),
         "flags": _run_flags_payload(),
         "result": result,
     }
@@ -1971,9 +1982,7 @@ def _repair_program_after_failure(program, error_text, gen_program=None, rng=Non
     comps = [_sanitize_component(c) for c in (program or {}).get("components", [])]
     base = comps[0] if comps else {"short_span": 60, "long_span": 105, "weight": 1.0}
     if "beta drift" in err:
-        repaired = _component_with_variant(base, "volume_gate")
-        repaired["params"] = {"vol_gate_window": int(repaired.get("params", {}).get("vol_gate_window", 20))}
-        return {"components": [_sanitize_component(repaired)]}
+        return None
     if "dead after market-neutral" in err or "not genuinely long-short" in err or "low signal activity" in err:
         repaired = _component_with_variant(base, "volume_confirm")
         repaired["params"] = {"vol_gate_window": int(repaired.get("params", {}).get("vol_gate_window", 20))}
@@ -2030,15 +2039,16 @@ def _eval_program_trial(program, context):
     raw_short_frac = float(m_val.get("raw_short_frac", m_core.get("raw_short_frac", 1.0)) or 0.0)
     signal_activity = float(m_val.get("signal_activity", m_core.get("signal_activity", 1.0)) or 0.0)
     beta_val = float(m_val.get("beta", 0.0))
+    beta_raw = float(m_val.get("beta_raw", beta_val) or 0.0)
+    beta_reduction = float(m_val.get("beta_reduction", abs(beta_raw) - abs(beta_val)) or 0.0)
+    beta_neutralized = bool(m_val.get("beta_neutralized", globals().get("BETA_NEUTRALIZE_POSITIONS", False)))
+    beta_gate_status = "scored_beta_high" if abs(beta_val) > BETA_LIMIT else "ok"
     if signal_activity < MIN_SIGNAL_ACTIVITY:
         return {"error": f"val_eval: SIGNAL_VALIDATION: low signal activity before walk-forward (active_frac={signal_activity:.2f})", "code": code}
     if raw_cs_std < MIN_RAW_CS_STD:
         return {"error": f"val_eval: SIGNAL_VALIDATION: weak cross-section before walk-forward (raw_cs_std={raw_cs_std:.3f})", "code": code}
     if min(raw_long_frac, raw_short_frac) < MIN_LONG_SHORT_FRAC:
         return {"error": f"val_eval: SIGNAL_VALIDATION: not genuinely long-short before walk-forward (long={raw_long_frac:.2f}, short={raw_short_frac:.2f})", "code": code}
-    if abs(beta_val) > max(BETA_LIMIT * 1.5, 0.06):
-        return {"error": f"val_eval: SIGNAL_VALIDATION: beta drift before walk-forward (beta={beta_val:+.3f})", "code": code}
-
     wf = []
     n = len(c_core)
     sz = max(n // WF_WINDOWS, 1)
@@ -2097,6 +2107,11 @@ def _eval_program_trial(program, context):
         "wf_median": val_wf_median,
         "wf_min": val_wf_min,
         "beta": beta_val,
+        "beta_neutralized": beta_neutralized,
+        "beta_raw": beta_raw,
+        "beta_neutralized_value": beta_val,
+        "beta_reduction": beta_reduction,
+        "beta_gate_status": beta_gate_status,
         "turnover": to_val,
         "consistency": val_cons,
         "raw_cs_std": raw_cs_std,
@@ -2449,6 +2464,7 @@ def _generation_family_telemetry(candidates, rows, survivors):
         "critic_rejected": {},
         "validation_failed": {},
         "scored": {},
+        "scored_beta_high": {},
         "robust": {},
         "survivor": {},
         "failure_reasons": {},
@@ -2460,6 +2476,8 @@ def _generation_family_telemetry(candidates, rows, survivors):
         err = row.get("error")
         if row.get("score") is not None:
             _inc_count(telemetry["scored"], fam)
+            if row.get("beta_gate_status") == "scored_beta_high":
+                _inc_count(telemetry["scored_beta_high"], fam)
             if row.get("robust_ok"):
                 _inc_count(telemetry["robust"], fam)
         elif err:
@@ -2983,7 +3001,8 @@ if RUN_PARAM_SEARCH:
             )
     if not parameter_df.empty:
         param_cols = [
-            "score", "robustness_score", "train_sharpe", "wf_median", "wf_min", "beta", "turnover",
+            "score", "robustness_score", "train_sharpe", "wf_median", "wf_min", "beta", "beta_raw",
+            "beta_reduction", "beta_gate_status", "turnover",
             "family", "mutation_type", "short_span", "long_span", "cluster_id", "signature", "params", "model_size_key", "robust_ok",
         ]
         param_cols = _cols_present(parameter_df, param_cols)
