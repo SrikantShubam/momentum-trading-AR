@@ -4,6 +4,13 @@
 
 Phase 1 exists to identify the best verified momentum method we can build, run, and reproduce honestly under a `2xT4` budget on the current `110`-stock daily market-neutral setup. This is a strict benchmark, not a broad finance-model survey. LoRA and broader model comparisons stay out of scope until Phase 1 produces a local winner or a clear no-winner diagnosis.
 
+## Current pivot
+
+- The current notebook prompt contract has been tightened to a `Strict Signal Math` mode inside `autoresearch_v2_final.ipynb`.
+- The LLM should generate only compact Pandas/NumPy alpha-kernel math, not full scripts, boilerplate execution code, or portfolio construction.
+- Candidate outputs must keep the existing `=== CANDIDATE ===` parser format while focusing mutations on residual momentum, volume conditioning, and volatility scaling.
+- The execution sandbox already injects `np` and `pd`; prompt changes should not weaken that namespace contract or alter candidate parsing behavior.
+
 ## Active implementation order
 
 Current stage:
@@ -64,6 +71,7 @@ Later, only if the evidence justifies the compute:
 - Generated notebooks are build artifacts, not the primary edit target:
   - `autoresearch_v2_final.ipynb`
   - `kaggle_submission/autoresearch_v2_final.ipynb`
+- When the benchmark requires a notebook-only hotfix for execution, keep the Kaggle submission copy in sync with the main notebook before pushing.
 
 ## Artifact interpretation
 
