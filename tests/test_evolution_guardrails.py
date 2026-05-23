@@ -1,6 +1,7 @@
 import ast
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
@@ -1020,6 +1021,52 @@ class EvolutionGuardrailTests(unittest.TestCase):
         self.assertIn('RUN_LLM_SMOKE = _env_truthy(os.getenv("AUTORESEARCH_RUN_LLM_SMOKE"), default=False)', build_source)
         self.assertIn("REQUESTED_LLM_MODEL = bool(RUN_LLM_STAGE or RUN_MOE_STAGE or RUN_LLM_SMOKE)", build_source)
         self.assertIn("SHOULD_LOAD_LLM_MODEL = bool(REQUESTED_LLM_MODEL and RUN_BNB_MODEL_LOAD)", build_source)
+
+    def test_builder_defines_param_search_constants_before_metric_cell_default_users(self):
+        build_source = (ROOT / "build_notebook_v2.py").read_text(encoding="utf-8")
+        metric_source = METRIC_CELL.read_text(encoding="utf-8")
+
+        constants_block = "PARAM_SEARCH_TRIALS = 200\nPARAM_SEARCH_SEED = SEED\nPARAM_SEARCH_MODE = \"random\""
+        self.assertIn(constants_block, build_source)
+        self.assertIn("# metric_cell_18 defines function defaults from these names at cell execution.", build_source)
+        self.assertIn("PARAM_SEARCH_SHORT_SPANS = [36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66]", build_source)
+        self.assertIn("PARAM_SEARCH_LONG_SPANS = [90, 95, 100, 105, 110, 120, 130, 140, 150]", build_source)
+        self.assertIn("PARAM_SEARCH_REGIME_THRESHOLDS = [18.0, 20.0, 22.0, 24.0, 28.0]", build_source)
+        self.assertIn("PARAM_SEARCH_VOL_WINDOWS = [10, 20, 30]", build_source)
+        self.assertIn("PARAM_SEARCH_VOL_GATE_WINDOWS = [10, 20, 40]", build_source)
+        self.assertIn("def sample_parameter_trials(n_trials=PARAM_SEARCH_TRIALS, seed=PARAM_SEARCH_SEED):", metric_source)
+        self.assertIn("def run_parameter_search(n_trials=PARAM_SEARCH_TRIALS):", metric_source)
+
+    def test_hf_token_handling_uses_secret_aliases_and_no_raw_token_literals(self):
+        build_source = (ROOT / "build_notebook_v2.py").read_text(encoding="utf-8")
+        notebook_source = NOTEBOOK.read_text(encoding="utf-8")
+        tests_source = Path(__file__).read_text(encoding="utf-8")
+
+        self.assertIn('HF_TOKEN, HF_TOKEN_SOURCE = _resolve_token(', build_source)
+        self.assertIn('"HF_TOKEN",', build_source)
+        self.assertIn('"HUGGINGFACEHUB_API_TOKEN",', build_source)
+        self.assertIn('"HUGGINGFACE_TOKEN",', build_source)
+        self.assertIn('"HF_API_TOKEN",', build_source)
+
+        raw_hf_pat = re.compile(r"hf_[A-Za-z0-9]{8,}")
+        self.assertIsNone(raw_hf_pat.search(build_source))
+        self.assertIsNone(raw_hf_pat.search(notebook_source))
+        self.assertIsNone(raw_hf_pat.search(tests_source))
+
+    def test_builder_and_notebook_enforce_strict_kaggle_gpu_t4x2_gate(self):
+        build_source = (ROOT / "build_notebook_v2.py").read_text(encoding="utf-8")
+        nb = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+        notebook_sources = ["".join(cell.get("source", "")) for cell in nb["cells"]]
+        notebook_model_source = next(src for src in notebook_sources if "def _require_kaggle_t4_x2" in src)
+
+        required_gate = 'if n_gpus != 2 or any("T4" not in name.upper() for name in names):'
+        self.assertIn(required_gate, build_source)
+        self.assertIn('llm_stage_error="requires_gpu_t4_x2"', build_source)
+        self.assertIn("This notebook must run on Kaggle GPU T4 x2.", build_source)
+
+        self.assertIn(required_gate, notebook_model_source)
+        self.assertIn('llm_stage_error="requires_gpu_t4_x2"', notebook_model_source)
+        self.assertIn("This notebook must run on Kaggle GPU T4 x2.", notebook_model_source)
 
 
 if __name__ == "__main__":

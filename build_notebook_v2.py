@@ -232,9 +232,21 @@ RUN_BNB_MODEL_LOAD = _env_truthy(
     os.getenv("AUTORESEARCH_ENABLE_BNB_LOAD"),
     default=(DEFAULT_LLM_RESEARCH_MODE or RUN_LLM_SMOKE),
 )
+RUN_PARAM_SEARCH = _env_truthy(os.getenv("AUTORESEARCH_RUN_PARAM_SEARCH"), default=False)
 RUN_HELDOUT_EVAL = True
 RUN_REPORTS = True
 REFLECTION_ENABLED = bool(RUN_LLM_STAGE and REFLECT_EVERY > 0)
+
+# Structured parameter search constants must exist even when the stage is off:
+# metric_cell_18 defines function defaults from these names at cell execution.
+PARAM_SEARCH_TRIALS = 200
+PARAM_SEARCH_SEED = SEED
+PARAM_SEARCH_MODE = "random"
+PARAM_SEARCH_SHORT_SPANS = [36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66]
+PARAM_SEARCH_LONG_SPANS = [90, 95, 100, 105, 110, 120, 130, 140, 150]
+PARAM_SEARCH_REGIME_THRESHOLDS = [18.0, 20.0, 22.0, 24.0, 28.0]
+PARAM_SEARCH_VOL_WINDOWS = [10, 20, 30]
+PARAM_SEARCH_VOL_GATE_WINDOWS = [10, 20, 40]
 
 if DEFAULT_LLM_RESEARCH_MODE and not HF_TOKEN:
     print(
@@ -735,9 +747,23 @@ update_runtime_state(
     actual_model_id=None,
 )
 
-if torch.cuda.device_count() == 0 and SHOULD_LOAD_LLM_MODEL:
-    update_runtime_state(llm_stage_error="no_cuda_gpu")
-    raise RuntimeError("No CUDA GPU detected. This notebook is configured for T4 sessions.")
+def _require_kaggle_t4_x2():
+    n_gpus = torch.cuda.device_count()
+    names = [torch.cuda.get_device_name(i) for i in range(n_gpus)]
+    if n_gpus != 2 or any("T4" not in name.upper() for name in names):
+        update_runtime_state(
+            llm_stage_error="requires_gpu_t4_x2",
+            cuda_device_count=n_gpus,
+            cuda_device_names=names,
+        )
+        raise RuntimeError(
+            "This notebook must run on Kaggle GPU T4 x2. "
+            f"Detected {n_gpus} CUDA device(s): {names}"
+        )
+    return names
+
+if SHOULD_LOAD_LLM_MODEL:
+    _require_kaggle_t4_x2()
 
 hub_kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
 

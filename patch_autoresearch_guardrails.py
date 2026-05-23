@@ -311,11 +311,22 @@ update_runtime_state(
     actual_model_id=None,
 )
 
-if torch.cuda.device_count() == 0 and SHOULD_LOAD_LLM_MODEL:
-    update_runtime_state(llm_stage_error="no_cuda_gpu")
-    raise RuntimeError("No CUDA GPU detected. This notebook is configured for T4 sessions.")
-
 hub_kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
+
+def _require_kaggle_t4_x2():
+    n_gpus = torch.cuda.device_count()
+    names = [torch.cuda.get_device_name(i) for i in range(n_gpus)]
+    if n_gpus != 2 or any("T4" not in name.upper() for name in names):
+        update_runtime_state(
+            llm_stage_error="requires_gpu_t4_x2",
+            cuda_device_count=n_gpus,
+            cuda_device_names=names,
+        )
+        raise RuntimeError(
+            "This notebook must run on Kaggle GPU T4 x2. "
+            f"Detected {n_gpus} CUDA device(s): {names}"
+        )
+    return names
 
 def _load_tokenizer(model_id):
     t = AutoTokenizer.from_pretrained(model_id, **hub_kwargs)
@@ -419,6 +430,7 @@ def ensure_model_loaded():
     return tok, model
 
 if SHOULD_LOAD_LLM_MODEL:
+    _require_kaggle_t4_x2()
     ensure_model_loaded()
     if RUN_LLM_SMOKE:
         try:
