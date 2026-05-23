@@ -227,6 +227,39 @@ def _partial_report_line(partial_report):
     return " ".join(fields)
 
 
+def _artifact_status_is_partial(*artifacts):
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        status = str(artifact.get("artifact_status", "")).strip().lower()
+        legacy_status = str(artifact.get("status", "")).strip().lower()
+        phase = str(artifact.get("phase", "")).strip().lower()
+        stop_reason = str(artifact.get("stop_reason", "")).strip().lower()
+        if status in {"partial", "checkpoint", "incomplete", "in_progress"}:
+            return True
+        if legacy_status in {"partial", "checkpoint", "incomplete", "in_progress"}:
+            return True
+        if phase in {"partial", "checkpoint", "incomplete", "in_progress"}:
+            return True
+        if stop_reason == "checkpoint_in_progress":
+            return True
+    return False
+
+def _llm_primary_execution_gap(runtime_metadata):
+    if not isinstance(runtime_metadata, dict):
+        return False
+    profile = str(runtime_metadata.get("run_profile", "")).strip().lower()
+    enabled = bool(runtime_metadata.get("llm_stage_enabled"))
+    executed = bool(runtime_metadata.get("llm_stage_executed"))
+    try:
+        calls = int(runtime_metadata.get("llm_calls", 0) or 0)
+    except Exception:
+        calls = 0
+    return profile == "llm_research" and enabled and ((not executed) or calls <= 0)
+
+
+
+
 test_results = [r for r in globals().get("test_results", []) if isinstance(r, dict)]
 log = _safe_rows_from_loader("load_log", "LOG_FILE")
 scope_meta = _runtime_family_scope_lists()
@@ -291,6 +324,7 @@ deferred_families = [family for family in configured_families if family not in e
 evolution_summary = _safe_dict_from_global("EVOLUTION_SUMMARY_FILE")
 evolution_memory = _safe_dict_from_global("EVOLUTION_MEMORY_FILE")
 partial_run_report = _safe_dict_from_global("PARTIAL_REPORT_FILE", "partial_run_report.json")
+partial_artifact_status = _artifact_status_is_partial(evolution_summary, partial_run_report)
 evolution_health_lines = _evolution_health_lines(evolution_summary, partial_run_report)
 partial_run_report_line = _partial_report_line(partial_run_report)
 search_robustness_line = _robustness_summary(search_rows)
@@ -304,6 +338,13 @@ unique_param_sigs = len({r.get("signature") for r in param if r.get("signature")
 param_unique_ratio = unique_param_sigs / max(len(param), 1)
 heldout_has_det = heldout_source_counts.get("deterministic", 0) > 0
 heldout_has_evo = heldout_source_counts.get("parameter_search_evolution", 0) > 0
+if partial_artifact_status:
+    heldout_winner = None
+    heldout_rule_status = "incomplete_partial_artifacts"
+    heldout_rule_reasons = [
+        "partial artifacts cannot produce an approved winner or deployment gate",
+        *list(heldout_rule_reasons),
+    ]
 heldout_has_approved_winner = bool(heldout_winner)
 heldout_winner_is_evo = bool(heldout_winner and heldout_winner.get("source") == "parameter_search_evolution")
 best_train_score = _float_or(best_train_search.get("score"), None) if best_train_search else None
@@ -363,7 +404,9 @@ if not heldout_has_approved_winner:
     adherence_score = min(90, adherence_score)
 if not economic_success:
     adherence_score = min(85, adherence_score)
-research_result_status = "successful" if heldout_has_approved_winner else "not-yet-successful"
+if partial_artifact_status:
+    adherence_score = min(60, adherence_score)
+research_result_status = "incomplete" if partial_artifact_status else ("successful" if heldout_has_approved_winner else "not-yet-successful")
 
 runtime_metadata = _runtime_scope_metadata()
 configured_model_id = runtime_metadata.get("configured_model_id", globals().get("CONFIGURED_MODEL_ID", globals().get("MODEL_ID", "unknown")))
@@ -372,10 +415,27 @@ llm_enabled = bool(runtime_metadata.get("llm_stage_enabled", globals().get("RUN_
 llm_loaded = bool(runtime_metadata.get("llm_stage_loaded", False) or globals().get("ACTIVE_MODEL_ID") or globals().get("model") is not None)
 llm_executed = bool(runtime_metadata.get("llm_stage_executed", False))
 llm_calls = int(_float_or(runtime_metadata.get("llm_calls"), 0.0))
+llm_execution_gap = _llm_primary_execution_gap(runtime_metadata)
+if llm_execution_gap:
+    heldout_winner = None
+    heldout_has_approved_winner = False
+    heldout_rule_status = "incomplete_llm_primary_no_calls"
+    heldout_rule_reasons = [
+        "llm-primary profile produced zero recorded LLM generation/reflection calls and cannot produce an approved winner or deployment gate",
+        *list(heldout_rule_reasons),
+    ]
+    adherence_score = min(60, adherence_score)
+    research_result_status = "incomplete"
 if llm_loaded and (not actual_model_id or actual_model_id == "(not loaded)"):
     actual_model_id = globals().get("ACTIVE_MODEL_ID") or globals().get("MODEL_ID") or configured_model_id
 llm_call_accounting_note = "none"
-if "autoresearch_evolution" in executed_families and llm_calls == 0:
+if llm_execution_gap:
+    llm_call_accounting_note = "llm-primary profile executed without recorded LLM generation/reflection calls"
+elif "autoresearch_evolution" in executed_families and llm_calls == 0 and not llm_executed:
+    llm_call_accounting_note = (
+        "deterministic program evolution only; LLM-backed AutoResearch generation/reflection did not execute"
+    )
+elif "autoresearch_evolution" in executed_families and llm_calls == 0:
     llm_call_accounting_note = "program evolution executed with zero recorded LLM generation/reflection calls"
 hf_meta = runtime_metadata.get("token_status", {}).get("hf", {})
 hf_state = "present" if hf_meta.get("present") else "missing"
@@ -415,6 +475,11 @@ md_text = f"""# AutoResearch v2 - Momentum Alpha Discovery
 **Universe:** {len(close_all.columns)} US equities | {close_all.index.min().date()} -> {close_all.index.max().date()}
 **Train:** through {TRAIN_END} | **Test (held-out):** after
 **Selection objective:** market-neutral net Sharpe (`SELECTION_OBJECTIVE={SELECTION_OBJECTIVE}`)
+
+## Run completeness
+- artifact status: {"partial/incomplete" if partial_artifact_status or llm_execution_gap else "final or not marked partial"}
+- deployment gate: {"blocked - partial artifacts or LLM-primary execution gap cannot produce an approved winner or deployment gate" if partial_artifact_status or llm_execution_gap else "evaluated by held-out winner rules below"}
+- AutoResearch mode: {llm_call_accounting_note}
 
 ## Method-family scope
 - configured roadmap families: {", ".join(configured_families) if configured_families else "none recorded"}
@@ -608,3 +673,4 @@ if evolution_memory and evolution_memory.get("generation_reflections"):
 if RUN_REPORTS or RUN_HELDOUT_EVAL:
     SUMMARY_MD.write_text(md_text)
 print(md_text)
+

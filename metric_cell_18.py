@@ -57,12 +57,12 @@ EVOLVE_CHAMPION_VARIANTS = ["regime_momentum", "volume_gate", "volume_confirm", 
 EVOLVE_ADAPTIVE_DIAGNOSTIC_RUN = True
 EVOLVE_PARENT_FAMILY_CAP = 0.40
 EVOLVE_FAMILY_QUOTAS = {
-    "volume_gate": 0.24,
-    "volume_confirm": 0.20,
-    "regime_momentum": 0.20,
-    "rank_norm": 0.12,
+    "volume_gate": 0.18,
+    "volume_confirm": 0.12,
+    "regime_momentum": 0.28,
+    "rank_norm": 0.16,
     "plain": 0.08,
-    "composite": 0.16,
+    "composite": 0.18,
 }
 EVOLVE_SAFE_COMPOSITE_PAIRS = [
     ("volume_gate", "rank_norm"),
@@ -70,6 +70,15 @@ EVOLVE_SAFE_COMPOSITE_PAIRS = [
     ("volume_gate", "regime_gate"),
     ("volume_confirm", "ts_momentum"),
 ]
+EVOLVE_ADAPTIVE_SIMPLE_FAMILY_QUOTAS = {
+    "regime_momentum": 0.34,
+    "volume_gate": 0.14,
+    "volume_confirm": 0.12,
+    "regime_gate": 0.16,
+    "rank_norm": 0.12,
+    "plain": 0.12,
+}
+EVOLVE_ADAPTIVE_FRAGILE_VARIANTS = ["vol_scale", "vol_adjusted", "multi_factor", "short_reversal"]
 EVOLVE_DIAGNOSIS_TOP_ROWS = 5
 VAL_FRACTION = 0.20
 EVAL_TIMEOUT_SEC = 25
@@ -269,41 +278,54 @@ def _evolution_policy_payload():
 def _robustness_failure_counts(rows):
     counts = {
         "train_sharpe": 0,
+        "val_sharpe": 0,
         "wf_median": 0,
         "wf_min": 0,
+        "val_wf_median": 0,
+        "val_wf_min": 0,
+        "train_wf_min": 0,
         "beta": 0,
         "turnover": 0,
         "signal_activity": 0,
         "raw_cs_std": 0,
         "long_short_balance": 0,
         "robustness_score": 0,
+        "program_robustness_score": 0,
     }
     for row in rows or []:
         if not isinstance(row, dict):
             continue
-        if row.get("train_sharpe", -99) <= 0:
-            counts["train_sharpe"] += 1
-        if row.get("wf_median", -99) <= 0:
-            counts["wf_median"] += 1
-        if row.get("wf_min", -99) <= -0.20:
-            counts["wf_min"] += 1
-        if abs(float(row.get("beta", 0.0) or 0.0)) > BETA_LIMIT:
-            counts["beta"] += 1
-        turnover = float(row.get("turnover", row.get("avg_turnover", 0.0)) or 0.0)
-        if not (MIN_ACTIVE_TURNOVER <= turnover <= TURNOVER_LIMIT):
-            counts["turnover"] += 1
-        if float(row.get("signal_activity", 1.0) or 0.0) < MIN_SIGNAL_ACTIVITY:
-            counts["signal_activity"] += 1
-        if float(row.get("raw_cs_std", 1.0) or 0.0) < MIN_RAW_CS_STD:
-            counts["raw_cs_std"] += 1
-        if min(
-            float(row.get("raw_long_frac", 1.0) or 0.0),
-            float(row.get("raw_short_frac", 1.0) or 0.0),
-        ) < MIN_LONG_SHORT_FRAC:
-            counts["long_short_balance"] += 1
-        if float(row.get("robustness_score", 0.0) or 0.0) < ROBUSTNESS_SCORE_FLOOR:
-            counts["robustness_score"] += 1
+        reasons = row.get("robust_fail_reasons")
+        if not reasons and row.get("score") is not None:
+            reasons = _evolution_robust_fail_reasons(row)
+        for reason in reasons or []:
+            counts[reason] = counts.get(reason, 0) + 1
     return counts
+
+
+def _recent_robust_failure_profile(rows):
+    failure_rows = [
+        r for r in rows or []
+        if isinstance(r, dict)
+        and r.get("score") is not None
+        and not r.get("robust_ok")
+    ]
+    counts = _robustness_failure_counts(failure_rows)
+    total = max(1, sum(int(v) for v in counts.values()))
+    return {
+        "counts": counts,
+        "beta_pressure": float(counts.get("beta", 0) / total),
+        "wf_min_pressure": float(
+            (
+                counts.get("wf_min", 0)
+                + counts.get("train_wf_min", 0)
+                + counts.get("val_wf_min", 0)
+                + counts.get("val_wf_median", 0)
+            )
+            / total
+        ),
+        "program_robustness_pressure": float(counts.get("program_robustness_score", 0) / total),
+    }
 
 
 def _generation_diagnosis_events(generation, valid_rows, robust_rows, benchmark_row=None):
@@ -337,6 +359,9 @@ def _generation_diagnosis_events(generation, valid_rows, robust_rows, benchmark_
                     "raw_long_frac": row.get("raw_long_frac"),
                     "raw_short_frac": row.get("raw_short_frac"),
                     "robustness_score": row.get("robustness_score"),
+                    "robust_fail_reasons": list(
+                        row.get("robust_fail_reasons") or _evolution_robust_fail_reasons(row)
+                    ),
                     "error": row.get("error"),
                 }
             )
@@ -507,9 +532,18 @@ def _partial_report_payload(all_rows, generations, total_evals, stop_reason, dia
     }
 
 
+def _artifact_stop_reason(stop_reason, partial=False):
+    if partial and stop_reason in (None, "max_generations_reached"):
+        return "checkpoint_in_progress"
+    if stop_reason is None:
+        return "max_generations_reached"
+    return stop_reason
+
+
 def _write_evolution_artifacts(all_rows, generations, memory_notes, programs, diagnosis_events, total_evals, stop_reason, partial=False, started=None, suppress_errors=False):
     def _write_all():
         artifact_rows = _sorted_artifact_rows(all_rows)
+        artifact_stop_reason = _artifact_stop_reason(stop_reason, partial=partial)
         _atomic_write_json(PARAM_SEARCH_FILE, artifact_rows)
         _atomic_write_json(EVOLUTION_LINEAGE_FILE, artifact_rows)
         _atomic_write_json(
@@ -518,7 +552,7 @@ def _write_evolution_artifacts(all_rows, generations, memory_notes, programs, di
                 artifact_rows,
                 generations,
                 total_evals,
-                stop_reason,
+                artifact_stop_reason,
                 diagnosis_events=diagnosis_events,
                 partial=partial,
                 started=started,
@@ -530,7 +564,7 @@ def _write_evolution_artifacts(all_rows, generations, memory_notes, programs, di
                 artifact_rows,
                 generations,
                 total_evals,
-                stop_reason,
+                artifact_stop_reason,
                 diagnosis_events=diagnosis_events,
                 partial=partial,
                 started=started,
@@ -563,7 +597,7 @@ def _write_evolution_artifacts(all_rows, generations, memory_notes, programs, di
                 artifact_rows,
                 generations,
                 total_evals,
-                stop_reason,
+                artifact_stop_reason,
                 diagnosis_events=diagnosis_events,
                 partial=partial,
                 started=started,
@@ -660,6 +694,89 @@ def robust_ok(metric_row, wf_floor=-0.20):
         and metric_row.get("raw_short_frac", 1.0) >= MIN_LONG_SHORT_FRAC
         and robustness_score(metric_row) >= ROBUSTNESS_SCORE_FLOOR
     )
+
+
+def _evolution_robust_fail_reasons(row):
+    """Explicit reasons a scored evolution row misses the robustness gates."""
+    if not isinstance(row, dict):
+        return ["invalid_row"]
+
+    def _float_value(key, default=0.0):
+        try:
+            value = row.get(key, default)
+            return float(default if value is None else value)
+        except Exception:
+            return float(default)
+
+    is_program_row = (
+        row.get("source") == "parameter_search_evolution"
+        or "val_sharpe" in row
+        or "val_wf_median" in row
+        or "val_wf_min" in row
+    )
+    train_sharpe = _float_value("train_sharpe", -99.0)
+    val_sharpe = _float_value("val_sharpe", train_sharpe)
+    wf_median = _float_value("wf_median", -99.0)
+    train_wf_min = _float_value("wf_min", -99.0)
+    val_wf_median = _float_value("val_wf_median", wf_median)
+    val_wf_min = _float_value("val_wf_min", train_wf_min)
+    beta = _float_value("beta", 0.0)
+    turnover = _float_value("turnover", _float_value("avg_turnover", 0.0))
+    signal_activity = _float_value("signal_activity", 1.0)
+    raw_cs_std = _float_value("raw_cs_std", 1.0)
+    raw_long_frac = _float_value("raw_long_frac", 1.0)
+    raw_short_frac = _float_value("raw_short_frac", 1.0)
+
+    reasons = []
+    if train_sharpe <= 0:
+        reasons.append("train_sharpe")
+
+    if is_program_row:
+        if val_sharpe <= 0:
+            reasons.append("val_sharpe")
+        if val_wf_median < EVOLVE_PROGRAM_MIN_VAL_WF_MEDIAN:
+            reasons.append("val_wf_median")
+        if val_wf_min < EVOLVE_PROGRAM_MIN_VAL_WF_MIN:
+            reasons.append("val_wf_min")
+        if train_wf_min <= -0.20:
+            reasons.append("train_wf_min")
+    else:
+        if wf_median <= 0:
+            reasons.append("wf_median")
+        if train_wf_min <= -0.20:
+            reasons.append("wf_min")
+
+    if abs(beta) > BETA_LIMIT:
+        reasons.append("beta")
+    if not (MIN_ACTIVE_TURNOVER <= turnover <= TURNOVER_LIMIT):
+        reasons.append("turnover")
+    if signal_activity < MIN_SIGNAL_ACTIVITY:
+        reasons.append("signal_activity")
+    if raw_cs_std < MIN_RAW_CS_STD:
+        reasons.append("raw_cs_std")
+    if min(raw_long_frac, raw_short_frac) < MIN_LONG_SHORT_FRAC:
+        reasons.append("long_short_balance")
+
+    robustness_payload = {
+        "train_sharpe": val_sharpe if is_program_row else train_sharpe,
+        "wf_median": val_wf_median if is_program_row else wf_median,
+        "wf_min": val_wf_min if is_program_row else train_wf_min,
+        "beta": beta,
+        "turnover": turnover,
+        "consistency": _float_value("consistency", 0.0),
+        "signal_activity": signal_activity,
+        "raw_cs_std": raw_cs_std,
+        "raw_long_frac": raw_long_frac,
+        "raw_short_frac": raw_short_frac,
+    }
+    score = _float_value("robustness_score", robustness_score(robustness_payload))
+    if is_program_row:
+        if score < EVOLVE_PROGRAM_ROBUSTNESS_FLOOR:
+            reasons.append("program_robustness_score")
+    elif score < ROBUSTNESS_SCORE_FLOOR:
+        reasons.append("robustness_score")
+
+    return reasons
 
 
 def wf_summary(windows):
@@ -1348,6 +1465,7 @@ def _build_generation_program(gen_id, parents, recent_rows):
     memo = _safe_load_memo_text().lower()
     valid = [r for r in recent_rows if r.get("score") is not None]
     robust = [r for r in valid if r.get("robust_ok")]
+    fail_profile = _recent_robust_failure_profile(valid)
     ranked = sorted(robust if robust else valid, key=lambda r: -_heldout_proxy_score(r))
     top = ranked[:8]
     top_clusters = [r.get("cluster_id") for r in top if r.get("cluster_id")]
@@ -1389,6 +1507,21 @@ def _build_generation_program(gen_id, parents, recent_rows):
             break
     if not focus_variants:
         focus_variants = ["regime_momentum", "volume_confirm", "volume_gate", "rank_norm", "regime_gate"]
+    if fail_profile["beta_pressure"] >= 0.25:
+        beta_safe_focus = ["volume_gate", "volume_confirm", "rank_norm", "plain"]
+        focus_variants = [v for v in beta_safe_focus if v in variant_space and v not in avoid_variants] + [
+            v for v in focus_variants if v not in beta_safe_focus
+        ]
+    if fail_profile["wf_min_pressure"] >= 0.25:
+        wf_safe_focus = ["regime_momentum", "regime_gate", "volume_confirm", "ts_momentum"]
+        focus_variants = [v for v in wf_safe_focus if v in variant_space and v not in avoid_variants] + [
+            v for v in focus_variants if v not in wf_safe_focus
+        ]
+        short_deltas = [-6, -3, 0, 3, 6]
+        long_deltas = [-24, -18, -12, -6, 0, 6, 12, 18, 24]
+    if fail_profile["program_robustness_pressure"] >= 0.25:
+        avoid_variants = list(dict.fromkeys(list(avoid_variants) + EVOLVE_ADAPTIVE_FRAGILE_VARIANTS))
+    focus_variants = list(dict.fromkeys(focus_variants))[: max(EVOLVE_MIN_FOCUS_VARIANTS, 6)]
 
     program = {
         "gen_id": gen_id,
@@ -1399,10 +1532,59 @@ def _build_generation_program(gen_id, parents, recent_rows):
         "focus_variants": focus_variants,
         "avoid_variants": avoid_variants,
         "fail_bias": fail_bias,
+        "robust_failure_profile": fail_profile,
         "dominant_cluster_frac": float(dominant_cluster_frac),
         "notes": "reflection-driven mutation program",
     }
     return program
+
+
+def _zero_robust_adaptive_overrides(generation, diagnoses, benchmark_row=None):
+    if not generation.get("zero_robust_counted"):
+        return {}
+    if float(generation.get("valid_rate", 0.0) or 0.0) < 0.50:
+        return {}
+    zero_events = [d for d in diagnoses or [] if d.get("kind") == "zero_robust"]
+    if not zero_events:
+        return {}
+
+    failures = dict(zero_events[-1].get("failure_counts", {}) or {})
+    total_failures = sum(int(v) for v in failures.values()) or 1
+    tail_risk_failures = sum(int(failures.get(k, 0)) for k in ("val_wf_min", "train_wf_min", "wf_min", "val_wf_median", "program_robustness_score"))
+    beta_failures = int(failures.get("beta", 0))
+    dominant_tail_risk = tail_risk_failures / total_failures >= 0.35
+    dominant_beta = beta_failures / total_failures >= 0.15
+    if not (dominant_tail_risk or dominant_beta):
+        return {}
+
+    focus = ["regime_momentum", "volume_gate", "volume_confirm", "regime_gate", "rank_norm", "plain"]
+    if benchmark_row and benchmark_row.get("mutation_type") in focus:
+        focus.remove(benchmark_row["mutation_type"])
+        focus.insert(0, benchmark_row["mutation_type"])
+
+    overrides = {
+        "focus_variants": focus,
+        "avoid_variants": list(EVOLVE_ADAPTIVE_FRAGILE_VARIANTS),
+        "family_quotas": dict(EVOLVE_ADAPTIVE_SIMPLE_FAMILY_QUOTAS),
+        "force_simple_components": True,
+        "force_explore": True,
+        "adaptive_reason": {
+            "trigger": "zero_robust_high_validity",
+            "failure_counts": failures,
+            "dominant_tail_risk": bool(dominant_tail_risk),
+            "dominant_beta": bool(dominant_beta),
+        },
+    }
+    if benchmark_row:
+        short_center = benchmark_row.get("short_span")
+        long_center = benchmark_row.get("long_span")
+        if short_center is not None:
+            overrides["short_center"] = int(short_center)
+            overrides["short_deltas"] = [-6, -3, 0, 3, 6]
+        if long_center is not None:
+            overrides["long_center"] = int(long_center)
+            overrides["long_deltas"] = [-12, -6, 0, 6, 12]
+    return overrides
 
 
 def _program_variant_mix(base_variant, program):
@@ -1850,21 +2032,37 @@ def _mutate_program(parent_program, gen_program, rng):
     program = {"components": [dict(c) for c in parent_program.get("components", [])]}
     if not program["components"]:
         program["components"] = [{"mutation_type": "regime_momentum", "short_span": 54, "long_span": 90, "params": {"vix_threshold": 26.0}, "weight": 1.0}]
+    fail_profile = gen_program.get("robust_failure_profile", {}) if isinstance(gen_program, dict) else {}
+    beta_pressure = float(fail_profile.get("beta_pressure", 0.0) or 0.0)
+    wf_min_pressure = float(fail_profile.get("wf_min_pressure", 0.0) or 0.0)
+    program_robustness_pressure = float(fail_profile.get("program_robustness_pressure", 0.0) or 0.0)
     op_choices = ["tweak", "tweak", "tweak", "swap_variant", "swap_variant", "reweight", "add"]
+    if beta_pressure >= 0.25:
+        op_choices += ["swap_variant", "reweight"]
+    if wf_min_pressure >= 0.25:
+        op_choices += ["tweak", "swap_variant"]
+    if program_robustness_pressure >= 0.25:
+        op_choices = [op for op in op_choices if op != "add"] + ["drop", "reweight"]
     if len(program["components"]) > 1:
         op_choices.append("drop")
     op = rng.choice(op_choices)
     focus = list(gen_program.get("focus_variants", ["regime_momentum", "volume_confirm", "rank_norm"]))
     avoid = set(gen_program.get("avoid_variants", []))
     idx = rng.randrange(0, len(program["components"]))
+    variant_pool = [v for v in focus if v not in avoid] or ["regime_momentum"]
+    if beta_pressure >= 0.25:
+        beta_safe = [v for v in ["volume_gate", "volume_confirm", "rank_norm", "plain"] if v in variant_pool]
+        variant_pool = beta_safe or variant_pool
     if op == "tweak":
         c = dict(program["components"][idx])
-        c["short_span"] = int(c.get("short_span", 54)) + rng.choice([-6, -3, 3, 6])
-        c["long_span"] = int(c.get("long_span", 90)) + rng.choice([-12, -6, 6, 12])
+        short_step = [-3, 3] if wf_min_pressure >= 0.25 else [-6, -3, 3, 6]
+        long_step = [6, 12, 18, 24] if wf_min_pressure >= 0.25 else [-12, -6, 6, 12]
+        c["short_span"] = int(c.get("short_span", 54)) + rng.choice(short_step)
+        c["long_span"] = int(c.get("long_span", 90)) + rng.choice(long_step)
         program["components"][idx] = _sanitize_component(c)
     elif op == "add" and len(program["components"]) < 4:
         base = dict(program["components"][idx])
-        base["mutation_type"] = rng.choice([v for v in focus if v not in avoid] or ["regime_momentum"])
+        base["mutation_type"] = rng.choice(variant_pool)
         base["short_span"] = int(base.get("short_span", 54)) + rng.choice([-9, -6, 6, 9])
         base["long_span"] = int(base.get("long_span", 90)) + rng.choice([-18, -12, 12, 18])
         base["weight"] = rng.uniform(0.6, 1.4)
@@ -1878,7 +2076,7 @@ def _mutate_program(parent_program, gen_program, rng):
             program["components"][i] = _sanitize_component(c)
     elif op == "swap_variant":
         c = dict(program["components"][idx])
-        c["mutation_type"] = rng.choice([v for v in focus if v not in avoid] or ["regime_momentum"])
+        c["mutation_type"] = rng.choice(variant_pool)
         program["components"][idx] = _sanitize_component(c)
     program["components"] = [_sanitize_component(c) for c in program["components"]]
     return program
@@ -2154,7 +2352,7 @@ def _eval_program_trial(program, context):
     )
 
     val_ret = (sig_val.shift(1).fillna(0) * c_val.pct_change().fillna(0)).mean(axis=1)
-    return {
+    result = {
         "source": "parameter_search_evolution",
         "family": "program_evolution",
         "base_family": "program_evolution",
@@ -2205,6 +2403,8 @@ def _eval_program_trial(program, context):
         "_val_ret": val_ret,
         **meta,
     }
+    result["robust_fail_reasons"] = _evolution_robust_fail_reasons(result)
+    return result
 
 
 def _candidate_programs(parents, gen_program, n_trials, rng):
@@ -2235,6 +2435,7 @@ def _candidate_programs(parents, gen_program, n_trials, rng):
     vol_windows = [int(x) for x in PARAM_SEARCH_VOL_WINDOWS] if "PARAM_SEARCH_VOL_WINDOWS" in globals() else [20, 30]
     vol_gate_windows = [int(x) for x in PARAM_SEARCH_VOL_GATE_WINDOWS] if "PARAM_SEARCH_VOL_GATE_WINDOWS" in globals() else [20, 40]
     force_explore = bool(gen_program.get("force_explore", False))
+    force_simple_components = bool(gen_program.get("force_simple_components", False))
     allowed_variants = {v for v, _ in parameter_search_variant_space()}
     focus_variants = [v for v in gen_program.get("focus_variants", ["regime_momentum"]) if v in allowed_variants]
     fallback_focus = ["regime_momentum", "volume_confirm", "volume_gate", "rank_norm", "plain", "regime_gate", "ts_momentum"]
@@ -2298,7 +2499,7 @@ def _candidate_programs(parents, gen_program, n_trials, rng):
         return True
 
     quota_total = max(0, min(n_trials, int(round(n_trials * 0.65))))
-    quota_items = list(EVOLVE_FAMILY_QUOTAS.items())
+    quota_items = list(gen_program.get("family_quotas", EVOLVE_FAMILY_QUOTAS).items())
     quota_counts = {family: max(1, int(round(quota_total * frac))) for family, frac in quota_items}
     while sum(quota_counts.values()) > quota_total and quota_counts:
         family = max(quota_counts, key=lambda k: quota_counts[k])
@@ -2326,7 +2527,7 @@ def _candidate_programs(parents, gen_program, n_trials, rng):
             "parent_score": None,
         }
         if force_explore or rng.random() < EVOLVE_RANDOM_EXPLORATION_FRAC:
-            n_comp = 1 if rng.random() < 0.88 else 2
+            n_comp = 1 if force_simple_components or rng.random() < 0.88 else 2
             base = {"components": [_sample_component() for _ in range(n_comp)]}
             prog = _mutate_program(base, gen_program, rng)
         else:
@@ -2428,7 +2629,8 @@ def _tournament_select(rows, k_survivors, rng):
             used_clusters.add(cid)
         selected.append(best)
         pool = [p for p in pool if p is not best]
-    return _family_capped_rows(selected + [p for p in original_pool if p not in selected], k_survivors)
+    selected_ids = {id(row) for row in selected}
+    return _family_capped_rows(selected + [p for p in original_pool if id(p) not in selected_ids], k_survivors)
 
 
 def _merge_parent_candidates(*groups, limit):
@@ -2528,7 +2730,7 @@ def run_evolution_search():
     c_core, v_core, x_core, t_core, c_val, v_val, x_val, t_val = _split_train_validation()
     eval_context = (c_core, v_core, x_core, t_core, c_val, v_val, x_val, t_val)
     total_evals = 0
-    stop_reason = "max_generations_reached"
+    stop_reason = None
     seen_clusters = set([p.get("cluster_id") for p in parents if p.get("cluster_id")])
     started = time.time()
     prev_best = -1e9
@@ -2538,6 +2740,7 @@ def run_evolution_search():
     zero_robust_streak = 0
     best_so_far_streak = 0
     global_rows = [r for r in _safe_load_search_results() if r.get("score") is not None]
+    adaptive_overrides = {}
 
     for gen_id in range(1, EVOLVE_MAX_GENERATIONS + 1):
         if total_evals >= EVOLVE_MAX_TOTAL_EVALS:
@@ -2549,6 +2752,8 @@ def run_evolution_search():
 
         recent_rows = all_rows[-400:] if all_rows else global_rows[:400]
         gen_program = _build_generation_program(gen_id, parents, recent_rows)
+        if adaptive_overrides:
+            gen_program.update(adaptive_overrides)
         programs.append(gen_program)
 
         remaining = EVOLVE_MAX_TOTAL_EVALS - total_evals
@@ -2663,6 +2868,8 @@ def run_evolution_search():
                 row["score"] = float(row["score"] + critique.get("score_adjust", 0.0))
             parent_score = cand.get("parent_score")
             row["score_gain_vs_parent"] = float(row["score"] - parent_score) if row.get("score") is not None and parent_score is not None else None
+            if row.get("score") is not None:
+                row["robust_fail_reasons"] = _evolution_robust_fail_reasons(row)
             gen_rows.append(row)
 
         total_evals += len(gen_rows)
@@ -2760,11 +2967,23 @@ def run_evolution_search():
             "survivor_families": family_telemetry.get("survivor", {}),
             "family_telemetry": family_telemetry,
             "program_focus_variants": list(gen_program.get("focus_variants", [])),
+            "adaptive_reason": gen_program.get("adaptive_reason"),
             "adaptive_diagnostic_run": bool(EVOLVE_ADAPTIVE_DIAGNOSTIC_RUN),
         }
         gen_diagnoses = _generation_diagnosis_events(generation_payload, valid, robust, benchmark_row=benchmark_row)
         generation_payload["diagnoses"] = gen_diagnoses
         diagnosis_events.extend(gen_diagnoses)
+        adaptive_overrides = _zero_robust_adaptive_overrides(
+            generation_payload,
+            gen_diagnoses,
+            benchmark_row=benchmark_row,
+        )
+        if adaptive_overrides:
+            generation_payload["next_generation_adaptive_reason"] = adaptive_overrides.get("adaptive_reason")
+            _warn(
+                f"g{gen_id}: adaptive zero-robust policy enabled "
+                f"{adaptive_overrides.get('adaptive_reason', {})}"
+            )
         for event in gen_diagnoses:
             if event.get("kind") == "stagnation":
                 _warn(
@@ -2821,6 +3040,7 @@ def run_evolution_search():
         if stop_after_generation:
             break
 
+    final_stop_reason = _artifact_stop_reason(stop_reason, partial=False)
     all_rows = _write_evolution_artifacts(
         all_rows,
         generations,
@@ -2828,7 +3048,7 @@ def run_evolution_search():
         programs,
         diagnosis_events,
         total_evals,
-        stop_reason,
+        final_stop_reason,
         partial=False,
         started=started,
     )

@@ -3,6 +3,7 @@ HELDOUT_SHORTLIST_K = 20
 HELDOUT_MAX_PER_CLUSTER = 2
 HELDOUT_MIN_DETERMINISTIC = 5
 HELDOUT_MIN_EVOLUTION = 10
+HELDOUT_MIN_LLM = 10
 HELDOUT_MIN_EVOLUTION_CHAMPIONS = 5
 HELDOUT_MAX_PER_MUTATION = 4
 COST_STRESS_BPS = (5.0, 10.0, 15.0)
@@ -688,11 +689,57 @@ def _ensemble_code(rows):
     )
 
 
+
+def _safe_load_llm_rows_local():
+    path = globals().get("LOG_FILE", globals().get("RESEARCH_LOG"))
+    if path is None:
+        return []
+    try:
+        if (not path.exists()) or path.stat().st_size == 0:
+            return []
+    except Exception:
+        return []
+    rows = []
+    try:
+        for raw_line in path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(row, dict) or not row.get("code"):
+                continue
+            if row.get("error"):
+                continue
+            if row.get("score") is None and row.get("research_score") is None:
+                continue
+            candidate = dict(row)
+            candidate["source"] = "llm_autoresearch"
+            if candidate.get("score") is None:
+                candidate["score"] = candidate.get("research_score")
+            if candidate.get("train_score") is None:
+                candidate["train_score"] = candidate.get("score")
+            if candidate.get("train_sharpe") is None:
+                candidate["train_sharpe"] = candidate.get("sharpe")
+            if candidate.get("signature") is None:
+                candidate["signature"] = candidate.get("code_fingerprint") or candidate.get("parent_id") or candidate.get("iter")
+            if candidate.get("cluster_id") is None:
+                candidate["cluster_id"] = f"llm:{candidate.get('family', candidate.get('mutation_type', 'unknown'))}"
+            if candidate.get("mutation_type") is None:
+                candidate["mutation_type"] = candidate.get("family", "llm_signal")
+            rows.append(candidate)
+    except Exception:
+        return []
+    return rows
 def _safe_load_search_results_local():
+    llm_rows = _safe_load_llm_rows_local()
     if "load_search_results" in globals():
         try:
             rows = _as_row_list(load_search_results())
             if rows:
+                rows.extend(llm_rows)
                 return rows
         except Exception:
             pass
@@ -711,6 +758,7 @@ def _safe_load_search_results_local():
             pass
     elif "DETERMINISTIC_FILE" in globals() and DETERMINISTIC_FILE.exists():
         rows.extend(_safe_json_rows(DETERMINISTIC_FILE))
+    rows.extend(llm_rows)
     return rows
 
 
@@ -1195,6 +1243,7 @@ def evaluate_on_test(top_k=TOP_K):
     active_scope_rows = [r for r in det if not _row_matches_deferred_stage_family(r)]
     deterministic = [r for r in active_scope_rows if r.get("source") == "deterministic"]
     evolution = [r for r in active_scope_rows if r.get("source") == "parameter_search_evolution"]
+    llm_rows = [r for r in active_scope_rows if r.get("source") == "llm_autoresearch"]
     evolution_champions = [r for r in evolution if r.get("origin") == "deterministic_champion"]
     evolution_rest = [r for r in evolution if r.get("origin") != "deterministic_champion"]
     ignored_other = [r for r in active_scope_rows if r.get("source") not in active_sources]
@@ -1202,6 +1251,7 @@ def evaluate_on_test(top_k=TOP_K):
     seen_sig = set()
     per_cluster = {}
     per_mutation = {}
+    picked.extend(_pick_diverse(llm_rows, HELDOUT_MIN_LLM, seen_sig, per_cluster, per_mutation))
     picked.extend(_pick_diverse(evolution_champions, HELDOUT_MIN_EVOLUTION_CHAMPIONS, seen_sig, per_cluster, per_mutation))
     picked.extend(_pick_diverse(evolution_rest, max(0, HELDOUT_MIN_EVOLUTION - len(picked)), seen_sig, per_cluster, per_mutation))
     picked.extend(_pick_diverse(deterministic, HELDOUT_MIN_DETERMINISTIC, seen_sig, per_cluster, per_mutation))
@@ -1238,6 +1288,23 @@ def evaluate_on_test(top_k=TOP_K):
 
 test_results = evaluate_on_test()
 heldout_report = _build_heldout_report(test_results)
+ensemble_file = OUT / "best_signal_ensemble.py"
+
+
+def _write_no_winner_export_guards(heldout_status, reasons=None):
+    reasons = list(reasons or [])
+    no_winner_guard = (
+        "# NO APPROVED WINNER - DEPLOYMENT BLOCKED\n"
+        f"# heldout_status={heldout_status}\n"
+        "# This file intentionally contains no signal function because this run failed the approved-winner gate.\n"
+        "# Rule gaps:\n"
+        + "".join(f"# - {reason}\n" for reason in reasons)
+        + "\nraise RuntimeError('No approved held-out winner; best_signal.py is non-deployable for this run.')\n"
+    )
+    BEST_CODE.write_text(no_winner_guard)
+    ensemble_file.write_text(no_winner_guard.replace("best_signal.py", "best_signal_ensemble.py"))
+
+
 if test_results:
     print(f"\n{'iter':>10} {'train_sc':>9} {'test_sc':>8} {'train_Sh':>9} {'test_Sh':>8} {'rob':>6} {'beta':>7} {'to':>6} {'wf_med':>7} {'test_dd':>8}")
     for r in test_results:
@@ -1247,31 +1314,42 @@ if test_results:
     best = heldout_report.get("leader")
     approved_winner = heldout_report.get("winner")
     comparison = heldout_report.get("comparison", {})
-    BEST_CODE.write_text(
-        f"# objective=market_neutral_net_sharpe  heldout_status={heldout_report.get('status')}  "
-        f"iter {best['iter']}  cluster={best['cluster_id']}  train_score={best['train_score']:+.2f}  "
-        f"test_score={best['test_score']:+.2f}  train_Sh={best['train_sharpe']:+.2f}  test_Sh={best['test_sharpe']:+.2f}\n"
-        f"# parent={best['parent_id']}  mutation={best['mutation_type']}\n"
-        f"# winner_rule_edge_vs_det={_float_or(heldout_report.get('score_edge_vs_deterministic'), 0.0):+.2f}  "
-        f"diagnostics={comparison.get('wins', 0)}W/{comparison.get('losses', 0)}L/{comparison.get('ties', 0)}T\n"
-        f"# HYPOTHESIS: {best['hypothesis']}\n\nimport numpy as np\n\n{best['code']}\n"
-    )
-    ensemble_rows = sorted(test_results, key=lambda r: -_float_or(r.get("test_score"), -999.0))[:min(ENSEMBLE_TOP_N, len(test_results))]
-    ensemble_file = OUT / "best_signal_ensemble.py"
-    ensemble_file.write_text(_ensemble_code(ensemble_rows))
-    print(f"\nheld-out leader (by composite score): iter {best['iter']}  saved to {BEST_CODE.name}")
     if approved_winner:
+        BEST_CODE.write_text(
+            f"# objective=market_neutral_net_sharpe  heldout_status={heldout_report.get('status')}  "
+            f"iter {approved_winner['iter']}  cluster={approved_winner['cluster_id']}  "
+            f"train_score={approved_winner['train_score']:+.2f}  "
+            f"test_score={approved_winner['test_score']:+.2f}  train_Sh={approved_winner['train_sharpe']:+.2f}  "
+            f"test_Sh={approved_winner['test_sharpe']:+.2f}\n"
+            f"# parent={approved_winner['parent_id']}  mutation={approved_winner['mutation_type']}\n"
+            f"# winner_rule_edge_vs_det={_float_or(heldout_report.get('score_edge_vs_deterministic'), 0.0):+.2f}  "
+            f"diagnostics={comparison.get('wins', 0)}W/{comparison.get('losses', 0)}L/{comparison.get('ties', 0)}T\n"
+            f"# HYPOTHESIS: {approved_winner['hypothesis']}\n\nimport numpy as np\n\n{approved_winner['code']}\n"
+        )
+        ensemble_rows = sorted(test_results, key=lambda r: -_float_or(r.get("test_score"), -999.0))[:min(ENSEMBLE_TOP_N, len(test_results))]
+        ensemble_file.write_text(_ensemble_code(ensemble_rows))
+        print(f"\nheld-out approved winner: iter {approved_winner['iter']}  saved to {BEST_CODE.name}")
         print(
             "approved winner: "
             f"iter {approved_winner['iter']} edge_vs_det={_float_or(heldout_report.get('score_edge_vs_deterministic'), 0.0):+.2f} "
             f"diagnostics={comparison.get('wins', 0)}W/{comparison.get('losses', 0)}L/{comparison.get('ties', 0)}T"
         )
+        print(f"ensemble ({len(ensemble_rows)} members) saved to {ensemble_file.name}")
     else:
+        _write_no_winner_export_guards(heldout_report.get("status"), heldout_report.get("reasons", []))
+        print(f"\nheld-out leader (by composite score): iter {best['iter']}  not exported as deployable code")
         print("approved winner: no winner yet")
         for reason in heldout_report.get("reasons", []):
             print("  rule gap:", reason)
-    print(f"ensemble ({len(ensemble_rows)} members) saved to {ensemble_file.name}")
+        print(f"deployment guard files written to {BEST_CODE.name} and {ensemble_file.name}")
 else:
+    _write_no_winner_export_guards(
+        "heldout_not_evaluated",
+        ["held-out evaluation skipped or no surviving candidates"],
+    )
     print("held-out evaluation skipped or no surviving candidates")
+    print(f"deployment guard files written to {BEST_CODE.name} and {ensemble_file.name}")
 
 _write_evolution_analysis(test_results)
+
+

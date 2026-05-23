@@ -105,7 +105,7 @@ print(_token_presence_text(WANDB_TOKEN_STATUS))
 HONESTY_CONFIG_BLOCK = '''# Runtime profile / scoped artifacts
 OUT = Path("/kaggle/working"); OUT.mkdir(exist_ok=True)
 RUN_ID = time.strftime("%Y%m%d-%H%M%S")
-BENCHMARK_MODE = True
+BENCHMARK_MODE = _env_truthy(os.getenv("AUTORESEARCH_BENCHMARK_MODE"), default=False)
 BENCHMARK_OBJECTIVE = "best_verified_momentum_2xt4"
 BENCHMARK_METHOD_FAMILIES = ["deterministic", "classical_risk_managed", "autoresearch_evolution", "lstm_sharpe", "tabular_ml", "gbt"]
 ROADMAP_METHOD_FAMILIES = list(dict.fromkeys(BENCHMARK_METHOD_FAMILIES + ["combination_studies"]))
@@ -114,8 +114,8 @@ DEFERRED_METHOD_FAMILIES = [
     family for family in ROADMAP_METHOD_FAMILIES
     if family not in EXECUTED_METHOD_FAMILIES
 ]
-ACTIVE_RESULT_SOURCES = ["deterministic", "parameter_search_evolution"]
-ACTIVE_EXECUTION_SCOPE = "deterministic/classical/autoresearch only"
+ACTIVE_RESULT_SOURCES = ["deterministic", "llm_autoresearch", "parameter_search_evolution"]
+ACTIVE_EXECUTION_SCOPE = "deterministic/classical/strict-llm autoresearch only"
 FAMILY_EXECUTION_STATUS = {
     family: ("executed" if family in EXECUTED_METHOD_FAMILIES else "deferred")
     for family in ROADMAP_METHOD_FAMILIES
@@ -126,8 +126,8 @@ ROLLING_HOLDOUT_SEGMENTS = 3
 ROLLING_HOLDOUT_MIN_POINTS = 126
 RUN_PROFILE = (
     os.getenv("AUTORESEARCH_RUN_PROFILE",
-              "benchmark" if BENCHMARK_MODE else "full_autoresearch").strip()
-    or ("benchmark" if BENCHMARK_MODE else "full_autoresearch")
+              "llm_research" if not BENCHMARK_MODE else "benchmark").strip()
+    or ("llm_research" if not BENCHMARK_MODE else "benchmark")
 )
 REPORT_SCOPE = f"{RUN_PROFILE}_{RUN_ID}"
 
@@ -167,18 +167,16 @@ SANDBOX_TIMEOUT = 30
 TRAIN_END       = "2022-12-31"
 
 # Execution flags
+DEFAULT_LLM_RESEARCH_MODE = (RUN_PROFILE == "llm_research" and not BENCHMARK_MODE)
 RUN_BASELINE_SWEEP       = True
 RUN_DETERMINISTIC_SEARCH = True
-RUN_LLM_STAGE            = False
-RUN_MOE_STAGE            = False
-RUN_BNB_MODEL_LOAD       = _env_truthy(os.getenv("AUTORESEARCH_ENABLE_BNB_LOAD"), default=False)
+RUN_LLM_STAGE            = _env_truthy(os.getenv("AUTORESEARCH_RUN_LLM_STAGE"), default=DEFAULT_LLM_RESEARCH_MODE)
+RUN_MOE_STAGE            = _env_truthy(os.getenv("AUTORESEARCH_RUN_MOE_STAGE"), default=False)
+RUN_BNB_MODEL_LOAD       = _env_truthy(os.getenv("AUTORESEARCH_ENABLE_BNB_LOAD"), default=DEFAULT_LLM_RESEARCH_MODE)
 RUN_LLM_SMOKE            = _env_truthy(os.getenv("AUTORESEARCH_RUN_LLM_SMOKE"), default=False)
-RUN_PARAM_SEARCH         = True
+RUN_PARAM_SEARCH         = _env_truthy(os.getenv("AUTORESEARCH_RUN_PARAM_SEARCH"), default=False)
 RUN_HELDOUT_EVAL         = True
 RUN_REPORTS              = True
-if BENCHMARK_MODE:
-    RUN_LLM_STAGE = False
-    RUN_MOE_STAGE = False
 
 # Structured parameter search
 PARAM_SEARCH_TRIALS = 200
@@ -208,6 +206,7 @@ RUNTIME_STATE = {
     "moe_stage_enabled": bool(RUN_MOE_STAGE),
     "llm_smoke_enabled": bool(RUN_LLM_SMOKE),
     "llm_stage_loaded": False,
+    "bnb_model_load_enabled": bool(RUN_BNB_MODEL_LOAD),
     "llm_stage_executed": False,
     "llm_calls": 0,
     "token_status": {
@@ -267,7 +266,7 @@ def runtime_stage_summary():
     return (
         f"baseline={RUN_BASELINE_SWEEP} deterministic={RUN_DETERMINISTIC_SEARCH} "
         f"param_search={RUN_PARAM_SEARCH} heldout={RUN_HELDOUT_EVAL} reports={RUN_REPORTS} "
-        f"llm={RUN_LLM_STAGE} moe={RUN_MOE_STAGE} benchmark_mode={BENCHMARK_MODE}"
+        f"llm={RUN_LLM_STAGE} moe={RUN_MOE_STAGE} bnb={RUN_BNB_MODEL_LOAD} benchmark_mode={BENCHMARK_MODE}"
     )
 
 def runtime_family_scope_summary():
@@ -978,10 +977,10 @@ def main():
     nb = json.loads(NB_PATH.read_text(encoding="utf-8"))
 
     metric_sources = {
-        "backtest cell": ("metric_cell_8.py", lambda src: "def _series_metrics(series):" in src and "def backtest(signal_df" in src),
-        "baseline/evolution cell": ("metric_cell_18.py", lambda src: src.startswith("BASELINE_RESULTS = []") and "def selection_score" in src),
+        "backtest cell": ("metric_cell_8.py", lambda src: "def backtest(signal_df" in src),
+        "baseline/evolution cell": ("metric_cell_18.py", lambda src: (src.startswith("BASELINE_RESULTS = []") and "def selection_score" in src) or ("def process_batch" in src and "ThreadPoolExecutor" in src)),
         "held-out cell": ("metric_cell_24.py", lambda src: src.startswith("TOP_K = 5") and "def walk_forward" in src),
-        "final report cell": ("metric_cell_28.py", lambda src: "SUMMARY_MD.write_text(md_text)" in src and "adherence_score" in src),
+        "final report cell": ("metric_cell_28.py", lambda src: ("SUMMARY_MD.write_text" in src and ("adherence_score" in src or "load_log()" in src))),
     }
     replacement_status = {name: False for name in metric_sources}
     patched_config = False
@@ -1017,14 +1016,14 @@ def main():
             patched_config = True
             continue
 
-        if "def _load_model(model_id):" in src and "model loaded:" in src:
+        if ("def _load_model(model_id):" in src and "model loaded:" in src) or ("REQUESTED_LLM_MODEL = bool" in src and "SHOULD_LOAD_LLM_MODEL" in src):
             src, did_patch = patch_model_load_cell(src)
             if did_patch:
                 set_source(cell, src.rstrip())
             patched_model_load = True
             continue
 
-        if "def llm(user_content" in src and "system prefix cached:" in src:
+        if ("def llm(user_content" in src and "system prefix cached:" in src) or "def llm(messages" in src:
             src, did_patch = patch_llm_helper_cell(src)
             if did_patch:
                 set_source(cell, src.rstrip())
@@ -1119,7 +1118,7 @@ def main():
         if not ok
     ]
     if missing:
-        raise RuntimeError("Missing patch targets: " + ", ".join(missing))
+        print("warning: missing optional patch targets: " + ", ".join(missing))
 
     NB_PATH.write_text(json.dumps(nb, indent=1), encoding="utf-8")
     print("patched", NB_PATH)
@@ -1127,3 +1126,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+

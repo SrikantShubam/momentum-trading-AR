@@ -6,10 +6,13 @@ Phase 1 exists to identify the best verified momentum method we can build, run, 
 
 ## Current pivot
 
-- The current notebook prompt contract has been tightened to a `Strict Signal Math` mode inside `autoresearch_v2_final.ipynb`.
-- The LLM should generate only compact Pandas/NumPy alpha-kernel math, not full scripts, boilerplate execution code, or portfolio construction.
-- Candidate outputs must keep the existing `=== CANDIDATE ===` parser format while focusing mutations on residual momentum, volume conditioning, and volatility scaling.
-- The execution sandbox already injects `np` and `pd`; prompt changes should not weaken that namespace contract or alter candidate parsing behavior.
+- The active Kaggle notebook is now `llm_research` first: LLM generation is enabled by default when `AUTORESEARCH_RUN_PROFILE=llm_research` and benchmark mode is off.
+- The LLM contract remains `Strict Signal Math`: generate compact Pandas/NumPy alpha kernels, not full scripts, boilerplate execution code, or portfolio construction.
+- Candidate outputs must keep the existing `=== CANDIDATE ===` parser format while focusing mutations on residual momentum, volume conditioning, volatility scaling, and optional VIX/TNX regime inputs.
+- The execution sandbox injects `np` and `pd`, passes optional `vix`/`tnx` into compatible `signal(close, volume, vix=None, tnx=None)` kernels, and validates strict matrix dimensionality.
+- Guarded heldout now admits scored `llm_autoresearch` rows from the research log alongside deterministic anchors, so viable strict LLM candidates are not stranded before final reporting.
+- LLM-primary runs with zero recorded LLM generation/reflection calls are marked incomplete and cannot pass the deployment gate.
+- Parameter-search evolution is no longer the default spend path for LLM-primary runs; it must be explicitly enabled with `AUTORESEARCH_RUN_PARAM_SEARCH=1`.
 
 ## Active implementation order
 
@@ -77,3 +80,4 @@ Later, only if the evidence justifies the compute:
 
 - Treat `outputs/*` old 20-stock results as historical only. They are not comparable evidence for the current guarded benchmark.
 - Treat `kaggle_run_v3/*` as the current guarded reference when interpreting present behavior and artifacts.
+
