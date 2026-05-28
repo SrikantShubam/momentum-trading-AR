@@ -61,23 +61,28 @@ Later, only if the evidence justifies the compute:
 - Diagnosis is explicit, not silent. Emit a diagnosis artifact/report and continue the broader benchmark unless a separate hard stop fires.
 - Diagnosis should summarize the stagnating family or branch, best-so-far composite trend, robustness trend, diversity trend, common failure reasons, and whether the issue looks like search collapse, score misalignment, validator pressure, or weak mutations.
 
-## Source-of-truth files to edit
+## Source-of-truth file to edit
 
-- Primary benchmark/reporting sources:
-  - `build_notebook_v2.py`
-  - `patch_autoresearch_guardrails.py`
-  - `metric_cell_18.py`
-  - `metric_cell_24.py`
-  - `metric_cell_28.py`
-- Tests for evolution/diagnostic behavior:
-  - `tests/test_evolution_guardrails.py`
-- Generated notebooks are build artifacts, not the primary edit target:
-  - `autoresearch_v2_final.ipynb`
+- Primary and only submission artifact:
   - `kaggle_submission/autoresearch_v2_final.ipynb`
-- When the benchmark requires a notebook-only hotfix for execution, keep the Kaggle submission copy in sync with the main notebook before pushing.
+- Local mirror:
+  - `artifacts/notebooks/autoresearch_v2_final.ipynb`
+- There is no active builder, patcher, or test pipeline in the notebook submission workflow.
 
 ## Artifact interpretation
 
-- Treat `outputs/*` old 20-stock results as historical only. They are not comparable evidence for the current guarded benchmark.
-- Treat `kaggle_run_v3/*` as the current guarded reference when interpreting present behavior and artifacts.
+- Treat `archive/outputs/*` old 20-stock results as historical only. They are not comparable evidence for the current guarded benchmark.
+- Treat `archive/kaggle_run_v3/*` as the current guarded reference when interpreting present behavior and artifacts.
+
+## Previous benchmark snapshot
+
+- `archive/results13.zip` is the last complete deterministic/evolution reference run with full summaries.
+- Best held-out leader was still deterministic: `regime_gate 54/90 @ VIX<20`, with composite score `+0.45` and test Sharpe `+0.42`.
+- Best evolved held-out candidate reached composite score `+0.39` and test Sharpe `+0.45`, but did not beat the deterministic baseline by the required edge.
+- Evolution stopped at `14` generations with stop reason `stagnation_reached`; valid-rate was high, but robust survivors were not converting into held-out edge.
+- Main recurring blockers in that run:
+  - zero robust winners across late generations despite many valid candidates
+  - heavy concentration in `volume_confirm` / `regime_momentum` families
+  - frequent near-constant signals caught by validator pressure
+  - no evolved candidate clearing the `+0.10` edge-over-deterministic winner rule
 

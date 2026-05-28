@@ -13,3 +13,5 @@ outputs/
 kaggle_run_v*/
 tmp_kaggle_output/
 tmp_nilay_output_check/
+archive/*
+!archive/README.md

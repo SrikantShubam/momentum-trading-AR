@@ -4,7 +4,7 @@
 
 **Goal:** Upgrade the current guarded notebook into a Phase 1 benchmark harness that honestly activates pure AutoResearch, strengthens benchmark discipline, adds stagnation diagnostics, and packages the run for Kaggle under the approved `2xT4` benchmark design. LSTM and any combination work come only after the standalone AutoResearch stage is honestly resolved.
 
-**Architecture:** Keep the notebook generator and patch layer as the source of truth. Implement benchmark policy and evolution logic in `metric_cell_18.py`, held-out/composite evaluation in `metric_cell_24.py`, final reporting in `metric_cell_28.py`, and notebook/runtime config in `build_notebook_v2.py` plus `patch_autoresearch_guardrails.py`. Preserve the generated `autoresearch_v2_final.ipynb` as a build artifact, not the primary hand-edited source.
+**Architecture:** Keep the notebook generator and patch layer as the source of truth. Implement benchmark policy and evolution logic in `metric_cell_18.py`, held-out/composite evaluation in `metric_cell_24.py`, final reporting in `metric_cell_28.py`, and notebook/runtime config in `build_notebook_v2.py` plus `patch_autoresearch_guardrails.py`. Preserve the generated `artifacts/notebooks/autoresearch_v2_final.ipynb` as a build artifact, not the primary hand-edited source.
 
 **Tech Stack:** Python, Jupyter notebook generation, pandas/numpy, PyTorch/transformers, Kaggle kernels, yfinance-based equity data, local tests via `pytest`
 
@@ -43,7 +43,7 @@ Check that:
 - Modify: `build_notebook_v2.py`
 - Modify: `patch_autoresearch_guardrails.py`
 - Modify: `metric_cell_28.py`
-- Regenerate: `autoresearch_v2_final.ipynb`
+- Regenerate: `artifacts/notebooks/autoresearch_v2_final.ipynb`
 
 - [ ] **Step 1: Update notebook config defaults for Phase 1**
 
@@ -193,8 +193,8 @@ If they did not execute, the report must say they were not run rather than imply
 
 **Files:**
 - Modify if needed: `kaggle_submission/kernel-metadata.json`
-- Regenerate: `autoresearch_v2_final.ipynb`
-- Copy/update: `kaggle_submission/autoresearch_v2_final.ipynb`
+- Regenerate: `artifacts/notebooks/autoresearch_v2_final.ipynb`
+- Sync/update: `kaggle_submission/autoresearch_v2_final.ipynb`
 
 - [ ] **Step 1: Regenerate the final notebook from source**
 
@@ -256,7 +256,7 @@ Combination studies require an evidence gate:
 
 ## Notes for execution
 
-- Do not hand-edit `autoresearch_v2_final.ipynb` unless source regeneration is insufficient for a narrow patch.
+- Do not hand-edit `artifacts/notebooks/autoresearch_v2_final.ipynb` unless source regeneration is insufficient for a narrow patch.
 - Keep `wiki.md` concise and operational; it should be usable by future agents without rereading the full spec.
 - Preserve old artifacts, but make new reporting clearly run-scoped to avoid cross-run confusion.
 - The current turn focuses on benchmark-contract and pure AutoResearch honesty upgrades, not implementation of LSTM or any broader model family.
